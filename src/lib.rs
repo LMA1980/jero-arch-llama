@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn test_project_lm_head_row_split_large_vocab() {
         // 128,256 vocabulary rows with hidden_dim = 16 (F32)
-        let rows = 128_256;
+        let rows = if cfg!(miri) { 1024 } else { 128_256 };
         let cols = 16;
         let mut raw_bytes = vec![0_u8; rows * cols * 4];
         // Populate first row and last row with distinct values
@@ -102,7 +102,7 @@ mod tests {
         // First row dot product: cols * (1.0 * 1.0) = 16.0
         assert!((logits[0] - 16.0).abs() < 1e-4);
         // Middle rows with zero weights should be 0.0
-        assert!((logits[1000] - 0.0).abs() < 1e-4);
+        assert!((logits[100] - 0.0).abs() < 1e-4);
         // Last row dot product: cols * (2.0 * 1.0) = 32.0
         assert!((logits[rows - 1] - 32.0).abs() < 1e-4);
     }
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn test_project_lm_head_row_split_tile_m_remainder_edge_case15() {
         // Edge Case 15: Vocabulary size not evenly divisible by TILE_M = 8 (e.g. 128_005 rows)
-        let rows = 128_005;
+        let rows = if cfg!(miri) { 1005 } else { 128_005 };
         let cols = 16;
         let mut raw_bytes = vec![0_u8; rows * cols * 4];
         for i in 0..cols {
@@ -129,7 +129,7 @@ mod tests {
         project_lm_head_row_split(&mut logits, &hidden, &tensor, &layout)
             .expect("remainder partition succeeds");
 
-        assert_eq!(logits.len(), 128_005);
+        assert_eq!(logits.len(), rows);
         assert!((logits[rows - 1] - 48.0).abs() < 1e-4);
     }
 
