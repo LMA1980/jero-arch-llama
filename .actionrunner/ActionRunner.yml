@@ -83,6 +83,7 @@ stages:
     depends_on: ["clippy-check", "audit-check"]
     tags: ["k3"]
     threads: 6
+    toolchain: "llvm-24"
     exclusive: true
     max_concurrent_per_node: 1
 
