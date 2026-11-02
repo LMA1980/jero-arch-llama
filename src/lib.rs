@@ -1,8 +1,8 @@
-//! `k3-arch-llama`: Meta Llama architecture recipe for the SpacemiT K3 platform.
+//! `k3-arch-llama`: Meta Llama architecture recipe for the `SpacemiT` K3 platform.
 //!
 //! Implements [`ArchRecipe`] for Meta Llama family models (`llama`, `llama4`),
-//! supporting Pre-RMSNorm, Grouped-Query Attention (GQA), SwiGLU FFN, smooth
-//! frequency-scaled RoPE, and interleaved attention without positional embeddings (iRoPE).
+//! supporting Pre-RMSNorm, Grouped-Query Attention (GQA), `SwiGLU` FFN, smooth
+//! frequency-scaled `RoPE`, and interleaved attention without positional embeddings (`iRoPE`).
 
 use k3_core::{ArchRecipe, ExecutionContext, K3Error, ModelWeights, QuantType};
 
