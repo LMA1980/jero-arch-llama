@@ -153,7 +153,8 @@ mod tests {
     fn test_llama_recipe_prefill_and_decode_step() {
         use k3_core::ArchRecipe;
 
-        let recipe = LlamaRecipe::new();
+        let mut recipe = LlamaRecipe::new();
+        recipe.num_layers = 1;
         let weights = TestWeights {
             tensors: Vec::new(),
         };

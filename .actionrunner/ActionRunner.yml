@@ -107,6 +107,7 @@ stages:
       - "miri-check"
     tags: ["k3"]
     threads: 6
+    toolchain: "llvm-24"
     exclusive: true
     max_concurrent_per_node: 1
 
@@ -116,6 +117,7 @@ stages:
     depends_on: ["bench-run", "miri-check"]
     tags: ["k3"]
     threads: 6
+    toolchain: "llvm-24"
     exclusive: false
     max_concurrent_per_node: 1
 
