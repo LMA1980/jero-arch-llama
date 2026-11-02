@@ -33,7 +33,7 @@ pub enum RopeScalingConfig {
         /// Context length used during base pre-training.
         original_max_position_embeddings: u32,
     },
-    /// LongRoPE dual-factor dynamic position interpolation.
+    /// `LongRoPE` dual-factor dynamic position interpolation.
     LongRope {
         /// Per-dimension scaling factors for short context lengths.
         short_factor: Vec<f32>,
@@ -148,6 +148,7 @@ impl LlamaRecipe {
     }
 
     /// Executes simulated or real forward layer kernels for a single token seed at `position`.
+    #[allow(clippy::needless_range_loop, clippy::manual_checked_ops)]
     #[expect(
         clippy::too_many_lines,
         clippy::similar_names,
