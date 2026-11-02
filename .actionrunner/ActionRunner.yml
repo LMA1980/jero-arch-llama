@@ -1,0 +1,143 @@
+version: "3"
+name: "k3-arch declarative pipeline: Hygiene, Coverage, Miri & Benchmarks"
+
+env:
+  CARGO_TERM_COLOR: "always"
+  RUST_TEST_THREADS: "1"
+
+tasks:
+  fmt-task:
+    tool: "cargo-fmt"
+    args: ["--all", "--", "--check"]
+    timeout_seconds: 120
+    sandbox_profile: "default_ci"
+
+  clippy-task:
+    tool: "cargo-clippy"
+    args: ["--all-targets", "--", "-D", "warnings"]
+    timeout_seconds: 600
+    sandbox_profile: "default_ci"
+
+  audit-task:
+    tool: "cargo-audit"
+    args: []
+    timeout_seconds: 180
+    sandbox_profile: "default_ci"
+
+  coverage-task:
+    tool: "cargo-llvm-cov"
+    args: ["--summary-only"]
+    timeout_seconds: 1800
+    sandbox_profile: "k3_hardware_bench"
+
+  miri-task:
+    tool: "cargo-miri"
+    args: ["test", "--lib"]
+    timeout_seconds: 1800
+    sandbox_profile: "default_ci"
+
+  bench-task:
+    tool: "cargo-bench"
+    args: []
+    timeout_seconds: 1800
+    sandbox_profile: "k3_hardware_bench"
+
+  build-release-task:
+    tool: "cargo-build"
+    args: ["--release"]
+    timeout_seconds: 1800
+    sandbox_profile: "k3_hardware_bench"
+
+stages:
+  - id: fmt-check
+    name: "Verify Rust Formatting (cargo fmt)"
+    tasks: ["fmt-task"]
+    tags: ["fmt"]
+    threads: 2
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: clippy-check
+    name: "Verify Rust Linter & Clippy Rules (cargo clippy)"
+    tasks: ["clippy-task"]
+    depends_on: ["fmt-check"]
+    tags: ["clippy"]
+    threads: 4
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: audit-check
+    name: "Verify Dependencies Security Advisories (cargo audit)"
+    tasks: ["audit-task"]
+    depends_on: ["fmt-check"]
+    tags: ["audit"]
+    threads: 2
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: coverage-check
+    name: "Evaluate Test Suite & Line Code Coverage (cargo llvm-cov)"
+    tasks: ["coverage-task"]
+    depends_on: ["clippy-check", "audit-check"]
+    tags: ["k3"]
+    threads: 6
+    exclusive: true
+    max_concurrent_per_node: 1
+
+  - id: miri-check
+    name: "Verify Safe Execution & Undefined Behavior via Miri (cargo miri test)"
+    tasks: ["miri-task"]
+    depends_on: ["coverage-check"]
+    tags: ["k3"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+
+  - id: bench-run
+    name: "Execute Native Micro-Benchmarks (cargo bench)"
+    tasks: ["bench-task"]
+    depends_on:
+      - "fmt-check"
+      - "clippy-check"
+      - "audit-check"
+      - "coverage-check"
+      - "miri-check"
+    tags: ["k3"]
+    threads: 6
+    exclusive: true
+    max_concurrent_per_node: 1
+
+  - id: build-release
+    name: "Build Release Binaries (cargo build --release)"
+    tasks: ["build-release-task"]
+    depends_on: ["bench-run", "miri-check"]
+    tags: ["k3"]
+    threads: 6
+    exclusive: false
+    max_concurrent_per_node: 1
+
+on_action:
+  push:
+    - fmt-check
+    - clippy-check
+    - audit-check
+    - coverage-check
+    - miri-check
+    - bench-run
+  pull_request:
+    - fmt-check
+    - clippy-check
+    - audit-check
+    - coverage-check
+    - miri-check
+    - bench-run
+  merge:
+    - fmt-check
+    - clippy-check
+    - audit-check
+    - coverage-check
+    - miri-check
+    - bench-run
+    - build-release
+  tag:
+    - build-release

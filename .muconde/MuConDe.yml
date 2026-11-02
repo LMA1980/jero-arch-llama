@@ -1,0 +1,14 @@
+version: "1"
+service: "k3-arch-llama"
+
+deployment:
+  target_nodes:
+    - "worker-riscv64"
+  binary_name: "k3-arch-llama"
+
+integration_tests:
+  - "unit-tests"
+
+verification:
+  bake_window_secs: 30
+  rollback_on_failure: true
