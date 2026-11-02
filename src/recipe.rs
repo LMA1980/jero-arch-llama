@@ -168,16 +168,33 @@ impl LlamaRecipe {
             if weights.contains_tensor(&attn_q_name) {
                 let q_tensor = weights.tensor(&attn_q_name)?;
                 if q_tensor.quant() == QuantType::Q4_K_M && q_tensor.num_elements() >= 512 {
-                    let mut q_proj = [base_val; 2];
-                    #[cfg(feature = "with-kernels")]
-                    {
-                        BaselineKernel::new().vec_dot_q4_k_m(
-                            &mut q_proj,
-                            &q_tensor,
-                            &hidden[..256.min(hidden.len())],
-                        )?;
+                    let shape = q_tensor.shape();
+                    if shape.len() == 2 {
+                        let (rows, cols) = if shape[1] % 256 == 0 {
+                            (shape[0], shape[1])
+                        } else if shape[0] % 256 == 0 {
+                            (shape[1], shape[0])
+                        } else {
+                            (0, 0)
+                        };
+                        if rows > 0 && cols > 0 {
+                            let mut q_proj = vec![base_val; rows];
+                            let in_vec = vec![base_val; cols];
+                            #[cfg(feature = "with-kernels")]
+                            {
+                                BaselineKernel::new().vec_dot_q4_k_m(
+                                    &mut q_proj,
+                                    &q_tensor,
+                                    &in_vec,
+                                )?;
+                            }
+                            #[cfg(not(feature = "with-kernels"))]
+                            {
+                                let _ = &mut q_proj;
+                            }
+                            hidden[0] = q_proj[0];
+                        }
                     }
-                    hidden[0] = q_proj[0];
                 }
             }
 
