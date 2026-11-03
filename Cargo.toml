@@ -19,8 +19,8 @@ pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [dependencies]
-k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git", branch = "feat/m4-epic1-llama-mistral-phi3" }
-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kernels-rvv.git", branch = "feat/m4-epic1-llama-mistral-phi3", optional = true }
+k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git", branch = "main" }
+kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kernels-rvv.git", branch = "main", optional = true }
 
 [features]
 default = ["with-kernels"]
