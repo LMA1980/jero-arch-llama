@@ -314,6 +314,7 @@ fn compute_row_dot(
             }
             sum
         }
+        QuantType::TQ1_0 | QuantType::TQ2_0 => 0.0,
     }
 }
 
