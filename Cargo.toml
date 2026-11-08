@@ -1,11 +1,11 @@
 [package]
-name = "k3-arch-llama"
+name = "jero-arch-llama"
 description = "Meta Llama architecture recipe (llama and llama4 iRoPE) for the SpacemiT K3 platform"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
-repository = "https://github.com/LMA1980/k3-arch-llama"
+repository = "https://github.com/LMA1980/jero-arch-llama"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -19,9 +19,9 @@ pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [dependencies]
-k3-core = { version = "0.1.0", git = "https://github.com/LMA1980/k3-core.git" }
-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/k3-kernels-rvv.git", optional = true }
+jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git", branch = "feat/m8-naming-alignment" }
+jero-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/jero-kernels-rvv.git", branch = "feat/m8-naming-alignment", optional = true }
 
 [features]
 default = ["with-kernels"]
-with-kernels = ["dep:kernels-rvv"]
+with-kernels = ["dep:jero-kernels-rvv"]
