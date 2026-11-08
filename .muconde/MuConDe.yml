@@ -1,10 +1,10 @@
 version: "1"
-service: "k3-arch-llama"
+service: "jero-arch-llama"
 
 deployment:
   target_nodes:
     - "worker-riscv64"
-  binary_name: "k3-arch-llama"
+  binary_name: "jero-arch-llama"
 
 integration_tests:
   - "unit-tests"

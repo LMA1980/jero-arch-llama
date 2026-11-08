@@ -1,4 +1,4 @@
-//! `k3-arch-llama`: Meta Llama architecture recipe for the `SpacemiT` K3 platform.
+//! `jero-arch-llama`: Meta Llama architecture recipe for the `SpacemiT` K3 platform.
 //!
 //! Implements [`ArchRecipe`] for Meta Llama family models (`llama`, `llama4`),
 //! supporting Pre-RMSNorm, Grouped-Query Attention (GQA), `SwiGLU` FFN, smooth
@@ -14,7 +14,7 @@ pub use recipe::{LlamaRecipe, RopeScalingConfig};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k3_core::{ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
+    use jero_core::{ExecutionContext, K3Error, ModelWeights, QuantType, TensorView};
 
     struct TestWeights<'a> {
         tensors: Vec<(&'static str, TensorView<'a>)>,
@@ -46,7 +46,7 @@ mod tests {
 
     #[test]
     fn test_llama_recipe_basic() {
-        use k3_core::ArchRecipe;
+        use jero_core::ArchRecipe;
 
         let recipe = LlamaRecipe::new();
         assert_eq!(recipe.architecture_id(), "llama");
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn test_llama4_recipe_irope_masking() {
-        use k3_core::ArchRecipe;
+        use jero_core::ArchRecipe;
 
         let recipe = LlamaRecipe::new_llama4().with_irope_mask(vec![false, true, false, true]);
         assert_eq!(recipe.architecture_id(), "llama4");
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_llama_recipe_prefill_and_decode_step() {
-        use k3_core::ArchRecipe;
+        use jero_core::ArchRecipe;
 
         let mut recipe = LlamaRecipe::new();
         recipe.num_layers = 1;

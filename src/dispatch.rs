@@ -4,10 +4,10 @@
 //! clusters on tile boundaries (`TILE_M = 8`), writing to non-overlapping contiguous slices
 //! of the output logits buffer per ADR-029 and ADR-037.
 
-use k3_core::{K3Error, QuantType, TensorView};
+use jero_core::{K3Error, QuantType, TensorView};
 
 #[cfg(feature = "with-kernels")]
-use kernels_rvv::{
+use jero_kernels_rvv::{
     bf16_to_f32_finite, dequantize_q6_k_block, dequantize_q8_0_block, f16_to_f32_finite,
 };
 
