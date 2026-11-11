@@ -21,6 +21,7 @@ undocumented_unsafe_blocks = "warn"
 [dependencies]
 jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git", branch = "main" }
 jero-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/jero-kernels-rvv.git", branch = "main", optional = true }
+rayon = "1.12"
 
 [features]
 default = ["with-kernels"]
