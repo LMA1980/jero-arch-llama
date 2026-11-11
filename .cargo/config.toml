@@ -1,0 +1,2 @@
+[target.riscv64gc-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+v"]
