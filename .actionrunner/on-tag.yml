@@ -20,21 +20,21 @@ stages:
 
   - id: coverage-check
     name: "Evaluate Test Suite & Line Code Coverage (cargo llvm-cov)"
-    tags: ["k3"]
+    tags: ["test"]
     depends_on: ["clippy-check"]
     threads: 2
     run: "cargo llvm-cov --summary-only"
 
   - id: miri-check
     name: "Verify Safe Execution & Undefined Behavior via Miri (cargo +nightly miri test)"
-    tags: ["k3"]
+    tags: ["test"]
     depends_on: ["coverage-check"]
     threads: 2
     run: "cargo +nightly miri test -p jero-arch-llama --lib"
 
   - id: build-release
     name: "Build Production Optimized Library"
-    tags: ["k3"]
+    tags: ["build"]
     depends_on: ["miri-check"]
     threads: 4
     run: "cargo build --release --package jero-arch-llama"
