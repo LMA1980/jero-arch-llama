@@ -19,8 +19,8 @@ pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [dependencies]
-jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git", branch = "feat/m8-naming-alignment" }
-jero-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/jero-kernels-rvv.git", branch = "feat/m8-naming-alignment", optional = true }
+jero-core = { version = "0.1.0", git = "https://github.com/LMA1980/jero-core.git", branch = "main" }
+jero-kernels-rvv = { version = "0.1.0", git = "https://github.com/LMA1980/jero-kernels-rvv.git", branch = "main", optional = true }
 
 [features]
 default = ["with-kernels"]
