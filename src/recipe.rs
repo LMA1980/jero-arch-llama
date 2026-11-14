@@ -6,15 +6,18 @@
 //! and `K`, `Llama-4` interleaved `iRoPE`, cached `128-byte`-aligned repacked weights, batched
 //! multi-token `prefill_step` GEMMs, row-parallel multi-threading, and tied/untied `output.weight`.
 
+use std::cell::RefCell;
+
 use jero_core::{
     ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
-    ModelMetadata, ModelWeights, QuantType, TensorDescriptor,
+    ModelMetadata, ModelWeights, QuantType, ScratchScope, ScratchWorkspace, TensorDescriptor,
 };
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    AttentionMaskConfig, BaselineKernel, VectorKernel, apply_rope_with_inv_freq_and_layout,
-    gqa_causal_attention_prefill_f32, precompute_rope_inv_freq, swiglu_f32,
+    AttentionMaskConfig, BaselineKernel, VectorKernel, apply_rope_with_cos_sin,
+    apply_rope_with_inv_freq_and_layout, compute_rope_cos_sin, gqa_causal_attention_prefill_f32,
+    precompute_rope_inv_freq, swiglu_f32,
 };
 #[cfg(feature = "with-kernels")]
 pub use jero_kernels_rvv::{RopeScalingConfig, RopeType};
@@ -85,12 +88,22 @@ impl AttentionMaskConfig {
     }
 }
 
+use crate::decode_gemv::{
+    BlockQ8_0, BlockQ8K, DecodeQ8Scratch, LayerKeyTable, LayerTensorKeys, bytes_as_q8_0_blocks_mut,
+    bytes_as_q8_k_blocks_mut, ensure_global_layer_keys, gemv_decode_projection,
+    probe_live_layer_count,
+};
 use crate::dispatch::{PhaseLayout, project_lm_head_row_split};
 use crate::repack_cache::{
-    Aligned128F32, LayerRepackCache, LmHeadCache, ModelRepackCache, QuantizedBatchAct,
-    decode_row_to_f32, get_or_decode_1d_f32, get_or_repack, quant_block_geometry, resolve_2d_dims,
-    set_active_model_anchor,
+    Aligned128F32, CachedFallbackGeometry, CachedLayerBiasFlags, CachedMatrix, DecodeActQ8View,
+    LayerRepackCache, LmHeadCache, ModelRepackCache, QuantizedBatchAct, decode_row_to_f32,
+    get_or_decode_1d_f32, get_or_repack, lookup_fallback_geometry, lookup_fallback_layer_biases,
+    quant_block_geometry, resolve_2d_dims, set_active_model_anchor, store_fallback_geometry,
 };
+
+thread_local! {
+    static FALLBACK_DECODE_SCRATCH: RefCell<Option<ScratchWorkspace>> = const { RefCell::new(None) };
+}
 
 /// Llama and Qwen2 architecture recipe implementation.
 #[derive(Debug, Clone)]
@@ -510,6 +523,29 @@ impl LlamaRecipe {
         self.prefill_step_inner(ctx, weights, Some(cache))
     }
 
+    /// Resolves total heap bytes required by a caller-supplied [`ScratchWorkspace`] for zero-alloc
+    /// `M = 1` autoregressive decode up to `seq_len_upper_bound` total context positions.
+    #[must_use]
+    pub fn decode_scratch_bytes(&self, seq_len_upper_bound: usize) -> usize {
+        let hd = self.head_dim.max(2);
+        let head_d_even = if hd % 2 == 0 { hd } else { hd - 1 };
+        let rotary_dim = self
+            .rotary_dim
+            .filter(|&r| r >= 2 && r % 2 == 0 && r <= head_d_even)
+            .unwrap_or(head_d_even);
+        let total_q = self.n_heads_q.max(1).saturating_mul(head_d_even);
+        let total_kv = self.n_heads_kv.max(1).saturating_mul(head_d_even);
+        compute_decode_scratch_bytes(
+            self.num_layers.max(1),
+            self.hidden_dim.max(2),
+            self.ffn_dim.max(2),
+            total_q,
+            total_kv,
+            rotary_dim,
+            seq_len_upper_bound.max(1),
+        )
+    }
+
     /// Executes single-token autoregressive decode using a caller-owned [`ModelRepackCache`],
     /// eliminating per-step `decode_1d_f32` allocations and global cache lookups.
     ///
@@ -571,6 +607,114 @@ impl LlamaRecipe {
         Ok(())
     }
 
+    #[expect(
+        clippy::type_complexity,
+        reason = "internal decode geometry and anchor tuple"
+    )]
+    fn resolve_decode_geometry(
+        &self,
+        weights: &dyn ModelWeights,
+        logits_len: usize,
+        cache: Option<&ModelRepackCache>,
+    ) -> Result<(EffectiveGeometry, Option<(bool, (usize, u64))>), K3Error> {
+        if let Some(c) = cache
+            && c.num_layers() > 0
+            && weights.tensor_count() > 0
+            && c.source_tensor_count() == weights.tensor_count()
+            && let Ok(norm0) = weights.tensor("blk.0.attn_norm.weight")
+            && norm0.num_elements() == c.hidden_dim()
+            && let Ok(q0) = weights.tensor("blk.0.attn_q.weight")
+            && resolve_2d_dims(&q0, c.hidden_dim()).ok().map(|d| d.0) == Some(c.total_q())
+            && let Ok(k0) = weights.tensor("blk.0.attn_k.weight")
+            && resolve_2d_dims(&k0, c.hidden_dim()).ok().map(|d| d.0) == Some(c.total_kv())
+            && c.layer_keys()
+                .get(c.num_layers() - 1)
+                .is_some_and(|keys| weights.tensor(&keys.attn_norm).is_ok())
+        {
+            let (n_heads_q, n_heads_kv, head_d_even) =
+                self.resolve_heads_from_totals(c.total_q(), c.total_kv())?;
+            let rotary_dim = self.resolve_rotary_dim(head_d_even)?;
+            return Ok((
+                EffectiveGeometry {
+                    num_layers: c.num_layers(),
+                    hidden_dim: c.hidden_dim(),
+                    ffn_dim: c.ffn_dim(),
+                    n_heads_q,
+                    n_heads_kv,
+                    head_d_even,
+                    rotary_dim,
+                    total_q: c.total_q(),
+                    total_kv: c.total_kv(),
+                },
+                None,
+            ));
+        }
+
+        if cache.is_none()
+            && weights.tensor_count() > 0
+            && let Ok(emb_tensor) = weights.tensor("token_embd.weight")
+        {
+            set_active_model_anchor(&emb_tensor);
+            if let Some((meta, anchor_tok)) = lookup_fallback_geometry(
+                &emb_tensor,
+                self.architecture_id(),
+                self.rotary_dim,
+                logits_len,
+            ) {
+                return Ok((
+                    EffectiveGeometry {
+                        num_layers: meta.num_layers,
+                        hidden_dim: meta.hidden_dim,
+                        ffn_dim: meta.ffn_dim,
+                        n_heads_q: meta.n_heads_q,
+                        n_heads_kv: meta.n_heads_kv,
+                        head_d_even: meta.head_d_even,
+                        rotary_dim: meta.rotary_dim,
+                        total_q: meta.total_q,
+                        total_kv: meta.total_kv,
+                    },
+                    Some((meta.has_output_weight, anchor_tok)),
+                ));
+            }
+            let geom = self.resolve_geometry(weights, logits_len)?;
+            let has_output_weight = weights.contains_tensor("output.weight");
+            let key_table = ensure_global_layer_keys(geom.num_layers);
+            let mut layer_biases = Vec::with_capacity(geom.num_layers);
+            for keys in key_table.as_slice().iter().take(geom.num_layers) {
+                layer_biases.push(CachedLayerBiasFlags::from_qkvo([
+                    weights.contains_tensor(&keys.attn_q_bias),
+                    weights.contains_tensor(&keys.attn_k_bias),
+                    weights.contains_tensor(&keys.attn_v_bias),
+                    weights.contains_tensor(&keys.attn_output_bias),
+                ]));
+            }
+            let anchor_tok = store_fallback_geometry(
+                &emb_tensor,
+                CachedFallbackGeometry {
+                    architecture: self.architecture_id(),
+                    rotary_dim_cfg: self.rotary_dim,
+                    logits_len,
+                    num_layers: geom.num_layers,
+                    hidden_dim: geom.hidden_dim,
+                    ffn_dim: geom.ffn_dim,
+                    n_heads_q: geom.n_heads_q,
+                    n_heads_kv: geom.n_heads_kv,
+                    head_d_even: geom.head_d_even,
+                    rotary_dim: geom.rotary_dim,
+                    total_q: geom.total_q,
+                    total_kv: geom.total_kv,
+                    has_output_weight,
+                },
+                layer_biases,
+            );
+            return Ok((geom, Some((has_output_weight, anchor_tok))));
+        }
+
+        let geom = self.resolve_geometry(weights, logits_len)?;
+        validate_cache_geometry(geom, cache)?;
+        Ok((geom, None))
+    }
+
     fn decode_step_inner(
         &self,
         ctx: &mut ExecutionContext<'_>,
@@ -585,28 +729,437 @@ impl LlamaRecipe {
             })?;
 
         let pos = ctx.position();
-        if pos.saturating_add(1) > ctx.n_ctx() {
+        let n_ctx = ctx.n_ctx();
+        let end_pos = pos.saturating_add(1);
+        if end_pos > n_ctx {
             return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: pos.saturating_add(1),
-                max_context_tokens: ctx.n_ctx(),
+                requested_tokens: end_pos,
+                max_context_tokens: n_ctx,
             });
         }
 
-        let logits_len = ctx.logits().len();
         let kv_geometry = ctx.kv_geometry();
-        let single = [token];
-        let hidden = self.execute_batch_forward(
-            &single,
-            pos,
-            ctx.kv_cache_mut(),
-            kv_geometry,
-            weights,
-            logits_len,
-            true,
-            cache,
-        )?;
+        let (logits, kv_cache, scratch_opt) = ctx.buffers_and_scratch_mut();
+        let (geom, fallback_meta) = self.resolve_decode_geometry(weights, logits.len(), cache)?;
+
+        if let Some(ws) = scratch_opt {
+            let scope = ws.scope();
+            self.execute_decode_in_scope(
+                &scope,
+                token,
+                pos,
+                kv_cache,
+                kv_geometry,
+                logits,
+                weights,
+                geom,
+                cache,
+                fallback_meta,
+            )?;
+        } else {
+            let needed = compute_decode_scratch_bytes(
+                geom.num_layers.max(1),
+                geom.hidden_dim,
+                geom.ffn_dim,
+                geom.total_q,
+                geom.total_kv,
+                geom.rotary_dim,
+                n_ctx.max(end_pos),
+            );
+            FALLBACK_DECODE_SCRATCH.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let needs_alloc = guard.as_ref().is_none_or(|ws| ws.capacity_bytes() < needed);
+                if needs_alloc {
+                    *guard = Some(ScratchWorkspace::new(needed)?);
+                }
+                let Some(ws) = guard.as_mut() else {
+                    return Ok(());
+                };
+                ws.reset();
+                let scope = ws.scope();
+                self.execute_decode_in_scope(
+                    &scope,
+                    token,
+                    pos,
+                    kv_cache,
+                    kv_geometry,
+                    logits,
+                    weights,
+                    geom,
+                    cache,
+                    fallback_meta,
+                )
+            })?;
+        }
+
         ctx.advance_position(1)?;
-        Self::project_logits(ctx, &hidden, weights, Some(token), cache)
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "orchestrates zero-allocation M=1 transformer block directly inside caller or fallback ScratchScope"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps M=1 RMSNorm, multi-row RVV GEMV projections, RoPE, causal GQA, and LM head linearly verifiable"
+    )]
+    fn execute_decode_in_scope(
+        &self,
+        scope: &ScratchScope<'_>,
+        token: u32,
+        pos: usize,
+        kv_cache: &mut [f32],
+        kv_geometry: Option<KvGeometry>,
+        logits: &mut [f32],
+        weights: &dyn ModelWeights,
+        geom: EffectiveGeometry,
+        cache: Option<&ModelRepackCache>,
+        fallback_meta: Option<(bool, (usize, u64))>,
+    ) -> Result<(), K3Error> {
+        let fallback_has_output = fallback_meta.map(|(has_out, _)| has_out);
+        let key_table_arc: std::sync::Arc<LayerKeyTable>;
+        let layer_keys = if let Some(c) = cache {
+            c.layer_keys().as_slice()
+        } else {
+            key_table_arc = ensure_global_layer_keys(geom.num_layers);
+            key_table_arc.as_slice()
+        };
+
+        let end_pos = pos + 1;
+        let synthetic_mode = weights.tensor_count() == 0;
+        let hidden = scope.alloc_f32_zeroed(geom.hidden_dim)?;
+        Self::embed_tokens(&[token], hidden, geom.hidden_dim, weights, cache.is_none())?;
+
+        let norm = scope.alloc_f32(geom.hidden_dim)?;
+        let q = scope.alloc_f32(geom.total_q)?;
+        let k = scope.alloc_f32(geom.total_kv)?;
+        let v = scope.alloc_f32(geom.total_kv)?;
+        let attn_out = scope.alloc_f32(geom.total_q)?;
+        let proj_hidden = scope.alloc_f32(geom.hidden_dim)?;
+        let gate = scope.alloc_f32(geom.ffn_dim)?;
+        let up = scope.alloc_f32(geom.ffn_dim)?;
+        let ffn_act = scope.alloc_f32(geom.ffn_dim)?;
+        let final_hidden = scope.alloc_f32_zeroed(geom.hidden_dim)?;
+        let scores_scratch = scope.alloc_f32(end_pos)?;
+
+        let half_rotary = geom.rotary_dim / 2;
+        let inv_freq = scope.alloc_f32(half_rotary)?;
+        let rope_cos = scope.alloc_f32(half_rotary)?;
+        let rope_sin = scope.alloc_f32(half_rotary)?;
+        fill_inv_freq_compat(
+            geom.rotary_dim,
+            self.rope_theta,
+            self.rope_scaling.as_ref(),
+            end_pos,
+            inv_freq,
+        )?;
+        if pos > 0 {
+            compute_rope_cos_sin_compat(pos, geom.rotary_dim, inv_freq, rope_cos, rope_sin)?;
+        }
+
+        let max_q8_cols = geom.hidden_dim.max(geom.total_q).max(geom.ffn_dim);
+        let small_blocks = max_q8_cols / 32;
+        let super_blocks = max_q8_cols / 256;
+        let small_raw = scope.alloc_u8(small_blocks.saturating_mul(size_of::<BlockQ8_0>()))?;
+        let small_buf = bytes_as_q8_0_blocks_mut(small_raw, small_blocks)?;
+        let super_raw = scope.alloc_u8(super_blocks.saturating_mul(size_of::<BlockQ8K>()))?;
+        let super_buf = bytes_as_q8_k_blocks_mut(super_raw, super_blocks)?;
+        let mut q8_scratch = DecodeQ8Scratch::new(small_buf, super_buf);
+
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "head_dim fits comfortably in f32"
+        )]
+        let attn_scale = 1.0_f32 / (geom.head_d_even as f32).sqrt();
+
+        for (layer, keys) in layer_keys.iter().take(geom.num_layers).enumerate() {
+            let layer_cache = cache.and_then(|c| c.layer(layer));
+            let fallback_biases =
+                if let (None, Some((_, anchor_tok))) = (layer_cache, fallback_meta) {
+                    lookup_fallback_layer_biases(anchor_tok, layer)
+                } else {
+                    None
+                };
+            let known_bias = |cached: Option<&Aligned128F32>, fb_present: Option<bool>| {
+                if layer_cache.is_some() {
+                    Some(cached.is_some())
+                } else {
+                    fb_present
+                }
+            };
+
+            self.apply_rmsnorm_batch(
+                norm,
+                hidden,
+                &keys.attn_norm,
+                layer_cache.map(|lc| &lc.attn_norm),
+                geom.hidden_dim,
+                1,
+                weights,
+            )?;
+
+            let qkv_act = DecodeActQ8View::quantize_row_in_scope(norm, scope)?;
+            project_decode_step_matrix(
+                q,
+                &keys.attn_q,
+                &qkv_act,
+                geom.total_q,
+                geom.hidden_dim,
+                weights,
+                layer_cache.map(|lc| &*lc.wq),
+                synthetic_mode,
+                1.0,
+            )?;
+            let q_bias = layer_cache.and_then(|lc| lc.attn_q_bias.as_ref());
+            add_optional_bias(
+                q,
+                &keys.attn_q_bias,
+                q_bias,
+                known_bias(q_bias, fallback_biases.map(CachedLayerBiasFlags::has_q)),
+                geom.total_q,
+                1,
+                weights,
+            )?;
+
+            project_decode_step_matrix(
+                k,
+                &keys.attn_k,
+                &qkv_act,
+                geom.total_kv,
+                geom.hidden_dim,
+                weights,
+                layer_cache.map(|lc| &*lc.wk),
+                synthetic_mode,
+                1.0,
+            )?;
+            let k_bias = layer_cache.and_then(|lc| lc.attn_k_bias.as_ref());
+            add_optional_bias(
+                k,
+                &keys.attn_k_bias,
+                k_bias,
+                known_bias(k_bias, fallback_biases.map(CachedLayerBiasFlags::has_k)),
+                geom.total_kv,
+                1,
+                weights,
+            )?;
+
+            project_decode_step_matrix(
+                v,
+                &keys.attn_v,
+                &qkv_act,
+                geom.total_kv,
+                geom.hidden_dim,
+                weights,
+                layer_cache.map(|lc| &*lc.wv),
+                synthetic_mode,
+                1.0,
+            )?;
+            let v_bias = layer_cache.and_then(|lc| lc.attn_v_bias.as_ref());
+            add_optional_bias(
+                v,
+                &keys.attn_v_bias,
+                v_bias,
+                known_bias(v_bias, fallback_biases.map(CachedLayerBiasFlags::has_v)),
+                geom.total_kv,
+                1,
+                weights,
+            )?;
+
+            if !self.should_skip_rope(layer) && pos > 0 {
+                apply_rope_with_cos_sin_compat(
+                    q,
+                    geom.head_d_even,
+                    geom.rotary_dim,
+                    self.rope_type,
+                    rope_cos,
+                    rope_sin,
+                )?;
+                apply_rope_with_cos_sin_compat(
+                    k,
+                    geom.head_d_even,
+                    geom.rotary_dim,
+                    self.rope_type,
+                    rope_cos,
+                    rope_sin,
+                )?;
+            }
+
+            execute_layer_causal_gqa(
+                layer,
+                pos,
+                1,
+                geom,
+                attn_scale,
+                q,
+                k,
+                v,
+                kv_cache,
+                kv_geometry,
+                synthetic_mode,
+                attn_out,
+                scores_scratch,
+            )?;
+
+            if layer_cache.is_some()
+                || !synthetic_mode
+                || weights.contains_tensor(&keys.attn_output)
+            {
+                let o_act = DecodeActQ8View::quantize_row_in_scope(attn_out, scope)?;
+                project_decode_step_matrix(
+                    proj_hidden,
+                    &keys.attn_output,
+                    &o_act,
+                    geom.hidden_dim,
+                    geom.total_q,
+                    weights,
+                    layer_cache.map(|lc| &*lc.wo),
+                    false,
+                    0.0,
+                )?;
+                let o_bias = layer_cache.and_then(|lc| lc.attn_output_bias.as_ref());
+                add_optional_bias(
+                    proj_hidden,
+                    &keys.attn_output_bias,
+                    o_bias,
+                    known_bias(o_bias, fallback_biases.map(CachedLayerBiasFlags::has_o)),
+                    geom.hidden_dim,
+                    1,
+                    weights,
+                )?;
+                for (h, &p) in hidden.iter_mut().zip(&*proj_hidden) {
+                    *h += p;
+                }
+            } else if synthetic_mode {
+                for (i, h) in hidden.iter_mut().enumerate() {
+                    *h += attn_out[i % geom.total_q] * 0.05;
+                }
+            } else {
+                return Err(missing_tensor_err(&keys.attn_output));
+            }
+
+            self.apply_rmsnorm_batch(
+                norm,
+                hidden,
+                &keys.ffn_norm,
+                layer_cache.map(|lc| &lc.ffn_norm),
+                geom.hidden_dim,
+                1,
+                weights,
+            )?;
+
+            let ffn_act_view = DecodeActQ8View::quantize_row_in_scope(norm, scope)?;
+            project_decode_step_matrix(
+                gate,
+                &keys.ffn_gate,
+                &ffn_act_view,
+                geom.ffn_dim,
+                geom.hidden_dim,
+                weights,
+                layer_cache.map(|lc| &*lc.wgate),
+                synthetic_mode,
+                1.0,
+            )?;
+            project_decode_step_matrix(
+                up,
+                &keys.ffn_up,
+                &ffn_act_view,
+                geom.ffn_dim,
+                geom.hidden_dim,
+                weights,
+                layer_cache.map(|lc| &*lc.wup),
+                synthetic_mode,
+                0.5,
+            )?;
+            swiglu_compat(ffn_act, gate, up)?;
+
+            if layer_cache.is_some() || !synthetic_mode || weights.contains_tensor(&keys.ffn_down) {
+                let down_act = DecodeActQ8View::quantize_row_in_scope(ffn_act, scope)?;
+                project_decode_step_matrix(
+                    proj_hidden,
+                    &keys.ffn_down,
+                    &down_act,
+                    geom.hidden_dim,
+                    geom.ffn_dim,
+                    weights,
+                    layer_cache.map(|lc| &*lc.wdown),
+                    false,
+                    0.0,
+                )?;
+                for (h, &p) in hidden.iter_mut().zip(&*proj_hidden) {
+                    *h += p;
+                }
+            } else if synthetic_mode {
+                for (i, h) in hidden.iter_mut().enumerate() {
+                    *h += ffn_act[i % geom.ffn_dim] * 0.01;
+                }
+            } else {
+                return Err(missing_tensor_err(&keys.ffn_down));
+            }
+        }
+
+        self.apply_rmsnorm_batch(
+            final_hidden,
+            hidden,
+            "output_norm.weight",
+            cache.map(ModelRepackCache::output_norm),
+            geom.hidden_dim,
+            1,
+            weights,
+        )?;
+
+        if logits.is_empty() {
+            if weights.tensor_count() > 0
+                && cache.is_none()
+                && fallback_has_output.is_none()
+                && !weights.contains_tensor("output.weight")
+                && !weights.contains_tensor("token_embd.weight")
+            {
+                return Err(missing_tensor_err("output.weight"));
+            }
+            return Ok(());
+        }
+
+        if let Some(c) = cache {
+            return match c.lm_head() {
+                LmHeadCache::Repacked(cached) => {
+                    let lm_act = DecodeActQ8View::quantize_row_in_scope(final_hidden, scope)?;
+                    cached.gemv_with_act_view(logits, &lm_act, true)
+                }
+                LmHeadCache::StreamingUntied => {
+                    let output_weight = weights.tensor("output.weight")?;
+                    q8_scratch.invalidate();
+                    gemv_decode_projection(logits, &output_weight, final_hidden, &mut q8_scratch)
+                }
+                LmHeadCache::StreamingTied => {
+                    let tied_weight = weights.tensor("token_embd.weight")?;
+                    q8_scratch.invalidate();
+                    gemv_decode_projection(logits, &tied_weight, final_hidden, &mut q8_scratch)
+                }
+            };
+        }
+
+        let has_output =
+            fallback_has_output.unwrap_or_else(|| weights.contains_tensor("output.weight"));
+        if has_output {
+            let output_weight = weights.tensor("output.weight")?;
+            q8_scratch.invalidate();
+            return gemv_decode_projection(logits, &output_weight, final_hidden, &mut q8_scratch);
+        }
+        if fallback_has_output == Some(false) || weights.contains_tensor("token_embd.weight") {
+            let tied_weight = weights.tensor("token_embd.weight")?;
+            q8_scratch.invalidate();
+            return gemv_decode_projection(logits, &tied_weight, final_hidden, &mut q8_scratch);
+        }
+        if weights.tensor_count() > 0 {
+            return Err(missing_tensor_err("output.weight"));
+        }
+
+        logits.fill(0.0);
+        let bias = (final_hidden.first().copied().unwrap_or(0.0).abs() % 0.25) * 0.01;
+        let next_slot = (usize::try_from(token).unwrap_or(0) + 1) % logits.len();
+        logits[next_slot] = 2.0 + bias;
+        Ok(())
     }
 
     fn resolve_rotary_dim(&self, head_d_even: usize) -> Result<usize, K3Error> {
@@ -757,18 +1310,7 @@ impl LlamaRecipe {
     }
 
     fn resolve_live_num_layers(weights: &dyn ModelWeights) -> Result<usize, K3Error> {
-        let mut probed = 0_usize;
-        for layer in 0..512 {
-            let has_layer = weights.contains_tensor(&format!("blk.{layer}.attn_norm.weight"))
-                || weights.contains_tensor(&format!("blk.{layer}.attn_q.weight"))
-                || weights.contains_tensor(&format!("blk.{layer}.ffn_gate.weight"))
-                || weights.contains_tensor(&format!("blk.{layer}.attn_output.weight"));
-            if has_layer {
-                probed = layer + 1;
-            } else if probed > 0 {
-                break;
-            }
-        }
+        let probed = probe_live_layer_count(weights, 512);
         if probed > 0 {
             Ok(probed)
         } else {
@@ -776,27 +1318,15 @@ impl LlamaRecipe {
         }
     }
 
-    fn resolve_live_heads(
+    fn resolve_heads_from_totals(
         &self,
-        weights: &dyn ModelWeights,
-        hidden_dim: usize,
+        q_rows: usize,
+        k_rows: usize,
     ) -> Result<(usize, usize, usize), K3Error> {
         let hd_default = {
             let d = self.head_dim.max(2);
             if d % 2 == 0 { d } else { d - 1 }
         };
-        if !weights.contains_tensor("blk.0.attn_q.weight") {
-            return Err(missing_tensor_err("blk.0.attn_q.weight"));
-        }
-        if !weights.contains_tensor("blk.0.attn_k.weight") {
-            return Err(missing_tensor_err("blk.0.attn_k.weight"));
-        }
-
-        let q_tensor = weights.tensor("blk.0.attn_q.weight")?;
-        let q_rows = resolve_2d_dims(&q_tensor, hidden_dim)?.0;
-        let k_tensor = weights.tensor("blk.0.attn_k.weight")?;
-        let k_rows = resolve_2d_dims(&k_tensor, hidden_dim)?.0;
-
         let cur_q = self.n_heads_q.max(1);
         let cur_kv = self.n_heads_kv.max(1);
         if cur_q * hd_default == q_rows && cur_kv * hd_default == k_rows && cur_q % cur_kv == 0 {
@@ -840,6 +1370,26 @@ impl LlamaRecipe {
                 "unable to resolve valid even head_dim for q_rows={q_rows}, k_rows={k_rows}"
             ),
         })
+    }
+
+    fn resolve_live_heads(
+        &self,
+        weights: &dyn ModelWeights,
+        hidden_dim: usize,
+    ) -> Result<(usize, usize, usize), K3Error> {
+        if !weights.contains_tensor("blk.0.attn_q.weight") {
+            return Err(missing_tensor_err("blk.0.attn_q.weight"));
+        }
+        if !weights.contains_tensor("blk.0.attn_k.weight") {
+            return Err(missing_tensor_err("blk.0.attn_k.weight"));
+        }
+
+        let q_tensor = weights.tensor("blk.0.attn_q.weight")?;
+        let q_rows = resolve_2d_dims(&q_tensor, hidden_dim)?.0;
+        let k_tensor = weights.tensor("blk.0.attn_k.weight")?;
+        let k_rows = resolve_2d_dims(&k_tensor, hidden_dim)?.0;
+
+        self.resolve_heads_from_totals(q_rows, k_rows)
     }
 
     fn embed_tokens(
@@ -949,33 +1499,7 @@ impl LlamaRecipe {
     ) -> Result<Vec<f32>, K3Error> {
         let m = tokens.len();
         let geom = self.resolve_geometry(weights, logits_len)?;
-        if let Some(c) = cache
-            && (c.num_layers() != geom.num_layers
-                || c.hidden_dim() != geom.hidden_dim
-                || c.ffn_dim() != geom.ffn_dim
-                || c.total_q() != geom.total_q
-                || c.total_kv() != geom.total_kv)
-        {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: "ModelRepackCache".to_owned(),
-                offset: 0,
-                byte_len: c.hidden_dim(),
-                buffer_len: geom.hidden_dim,
-                reason: format!(
-                    "ModelRepackCache geometry (layers={}, hidden={}, ffn={}, q={}, kv={}) mismatches model ({}, {}, {}, {}, {})",
-                    c.num_layers(),
-                    c.hidden_dim(),
-                    c.ffn_dim(),
-                    c.total_q(),
-                    c.total_kv(),
-                    geom.num_layers,
-                    geom.hidden_dim,
-                    geom.ffn_dim,
-                    geom.total_q,
-                    geom.total_kv,
-                ),
-            });
-        }
+        validate_cache_geometry(geom, cache)?;
         if m == 0 {
             return Ok(if compute_logits {
                 vec![0.0_f32; geom.hidden_dim]
@@ -983,6 +1507,14 @@ impl LlamaRecipe {
                 Vec::new()
             });
         }
+
+        let key_table_arc: std::sync::Arc<LayerKeyTable>;
+        let layer_keys = if let Some(c) = cache {
+            c.layer_keys().as_slice()
+        } else {
+            key_table_arc = ensure_global_layer_keys(geom.num_layers);
+            key_table_arc.as_slice()
+        };
 
         let synthetic_mode = weights.tensor_count() == 0;
         let end_pos = start_pos + m;
@@ -1022,14 +1554,14 @@ impl LlamaRecipe {
         )]
         let attn_scale = 1.0_f32 / (geom.head_d_even as f32).sqrt();
 
-        for layer in 0..geom.num_layers {
+        for (layer, keys) in layer_keys.iter().enumerate().take(geom.num_layers) {
             let layer_cache = cache.and_then(|c| c.layer(layer));
 
             // 1. Pre-Attention RMSNorm
             self.apply_rmsnorm_batch(
                 &mut norm_batch,
                 &hidden_batch,
-                &format!("blk.{layer}.attn_norm.weight"),
+                &keys.attn_norm,
                 layer_cache.map(|lc| &lc.attn_norm),
                 geom.hidden_dim,
                 m,
@@ -1038,7 +1570,7 @@ impl LlamaRecipe {
 
             // 2. Batched Q, K, V projections sharing reusable pre-quantized activation scratch
             project_qkv_layer(
-                layer,
+                keys,
                 &norm_batch,
                 &mut q_batch,
                 &mut k_batch,
@@ -1107,9 +1639,9 @@ impl LlamaRecipe {
                 )?;
                 add_optional_bias(
                     &mut proj_hidden_batch,
-                    &format!("blk.{layer}.attn_output.bias"),
+                    &keys.attn_output_bias,
                     lc.attn_output_bias.as_ref(),
-                    true,
+                    Some(lc.attn_output_bias.is_some()),
                     geom.hidden_dim,
                     m,
                     weights,
@@ -1118,13 +1650,13 @@ impl LlamaRecipe {
                     *h += p;
                 }
             } else {
-                let attn_out_name = format!("blk.{layer}.attn_output.weight");
-                if weights.contains_tensor(&attn_out_name) {
-                    let out_tensor = weights.tensor(&attn_out_name)?;
+                let attn_out_name = &keys.attn_output;
+                if weights.contains_tensor(attn_out_name) {
+                    let out_tensor = weights.tensor(attn_out_name)?;
                     let (rows, cols) = resolve_2d_dims(&out_tensor, geom.total_q)?;
                     if rows != geom.hidden_dim {
                         return Err(K3Error::TensorBoundsError {
-                            tensor_name: attn_out_name,
+                            tensor_name: attn_out_name.clone(),
                             offset: out_tensor.offset(),
                             byte_len: out_tensor.byte_len(),
                             buffer_len: out_tensor.as_bytes().len(),
@@ -1150,9 +1682,9 @@ impl LlamaRecipe {
                     )?;
                     add_optional_bias(
                         &mut proj_hidden_batch,
-                        &format!("blk.{layer}.attn_output.bias"),
+                        &keys.attn_output_bias,
                         None,
-                        false,
+                        None,
                         geom.hidden_dim,
                         m,
                         weights,
@@ -1170,7 +1702,7 @@ impl LlamaRecipe {
                         }
                     }
                 } else {
-                    return Err(missing_tensor_err(&attn_out_name));
+                    return Err(missing_tensor_err(attn_out_name));
                 }
             }
 
@@ -1178,7 +1710,7 @@ impl LlamaRecipe {
             self.apply_rmsnorm_batch(
                 &mut norm_batch,
                 &hidden_batch,
-                &format!("blk.{layer}.ffn_norm.weight"),
+                &keys.ffn_norm,
                 layer_cache.map(|lc| &lc.ffn_norm),
                 geom.hidden_dim,
                 m,
@@ -1187,7 +1719,7 @@ impl LlamaRecipe {
 
             // 7. Batched SwiGLU FFN & Residual Connection
             execute_layer_swiglu_ffn(
-                layer,
+                keys,
                 &norm_batch,
                 &mut gate_batch,
                 &mut up_batch,
@@ -1368,29 +1900,29 @@ impl ArchRecipe for LlamaRecipe {
             check_resident("output.weight")?;
         }
 
-        for layer in 0..geom.num_layers {
-            for suffix in [
-                "attn_norm.weight",
-                "attn_q.weight",
-                "attn_k.weight",
-                "attn_v.weight",
-                "attn_output.weight",
-                "ffn_norm.weight",
-                "ffn_gate.weight",
-                "ffn_up.weight",
-                "ffn_down.weight",
+        let layer_keys = ensure_global_layer_keys(geom.num_layers);
+        for keys in layer_keys.as_slice().iter().take(geom.num_layers) {
+            for required in [
+                &keys.attn_norm,
+                &keys.attn_q,
+                &keys.attn_k,
+                &keys.attn_v,
+                &keys.attn_output,
+                &keys.ffn_norm,
+                &keys.ffn_gate,
+                &keys.ffn_up,
+                &keys.ffn_down,
             ] {
-                check_resident(&format!("blk.{layer}.{suffix}"))?;
+                check_resident(required)?;
             }
             for opt_bias in [
-                "attn_q.bias",
-                "attn_k.bias",
-                "attn_v.bias",
-                "attn_output.bias",
+                &keys.attn_q_bias,
+                &keys.attn_k_bias,
+                &keys.attn_v_bias,
+                &keys.attn_output_bias,
             ] {
-                let name = format!("blk.{layer}.{opt_bias}");
-                if weights.contains_tensor(&name) {
-                    check_resident(&name)?;
+                if weights.contains_tensor(opt_bias) {
+                    check_resident(opt_bias)?;
                 }
             }
         }
@@ -1415,13 +1947,148 @@ impl ArchRecipe for LlamaRecipe {
     }
 }
 
+fn validate_cache_geometry(
+    geom: EffectiveGeometry,
+    cache: Option<&ModelRepackCache>,
+) -> Result<(), K3Error> {
+    if let Some(c) = cache
+        && (c.num_layers() != geom.num_layers
+            || c.hidden_dim() != geom.hidden_dim
+            || c.ffn_dim() != geom.ffn_dim
+            || c.total_q() != geom.total_q
+            || c.total_kv() != geom.total_kv)
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "ModelRepackCache".to_owned(),
+            offset: 0,
+            byte_len: c.hidden_dim(),
+            buffer_len: geom.hidden_dim,
+            reason: format!(
+                "ModelRepackCache geometry (layers={}, hidden={}, ffn={}, q={}, kv={}) mismatches model ({}, {}, {}, {}, {})",
+                c.num_layers(),
+                c.hidden_dim(),
+                c.ffn_dim(),
+                c.total_q(),
+                c.total_kv(),
+                geom.num_layers,
+                geom.hidden_dim,
+                geom.ffn_dim,
+                geom.total_q,
+                geom.total_kv,
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn compute_decode_scratch_bytes(
+    num_layers: usize,
+    hidden_dim: usize,
+    ffn_dim: usize,
+    total_q: usize,
+    total_kv: usize,
+    rotary_dim: usize,
+    seq_len_upper_bound: usize,
+) -> usize {
+    const fn a128(bytes: usize) -> usize {
+        bytes.next_multiple_of(128)
+    }
+    let f32_b = size_of::<f32>();
+    let half_rotary = rotary_dim / 2;
+    let max_q8_cols = hidden_dim.max(total_q).max(ffn_dim);
+    let small_bytes = (max_q8_cols / 32).saturating_mul(size_of::<BlockQ8_0>());
+    let super_bytes = (max_q8_cols / 256).saturating_mul(size_of::<BlockQ8K>());
+    let view_hidden = DecodeActQ8View::scratch_bytes_for_row(hidden_dim);
+    let view_q = DecodeActQ8View::scratch_bytes_for_row(total_q);
+    let view_ffn = DecodeActQ8View::scratch_bytes_for_row(ffn_dim);
+    let per_layer_views = view_hidden
+        .saturating_mul(2)
+        .saturating_add(view_q)
+        .saturating_add(view_ffn);
+    let total_views = num_layers
+        .max(1)
+        .saturating_mul(per_layer_views)
+        .saturating_add(view_hidden);
+    // Account for initial cursor alignment plus every ScratchScope and DecodeActQ8View allocation.
+    128_usize
+        .saturating_add(a128(hidden_dim.saturating_mul(f32_b)).saturating_mul(5))
+        .saturating_add(a128(total_q.saturating_mul(f32_b)).saturating_mul(2))
+        .saturating_add(a128(total_kv.saturating_mul(f32_b)).saturating_mul(2))
+        .saturating_add(a128(ffn_dim.saturating_mul(f32_b)).saturating_mul(3))
+        .saturating_add(a128(seq_len_upper_bound.max(1).saturating_mul(f32_b)))
+        .saturating_add(a128(half_rotary.saturating_mul(f32_b)).saturating_mul(3))
+        .saturating_add(a128(small_bytes))
+        .saturating_add(a128(super_bytes))
+        .saturating_add(total_views)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single-token zero-allocation decode projection sharing DecodeActQ8View"
+)]
+fn project_decode_step_matrix(
+    out: &mut [f32],
+    tensor_name: &str,
+    act_view: &DecodeActQ8View<'_>,
+    expected_rows: usize,
+    expected_cols: usize,
+    weights: &dyn ModelWeights,
+    cached_matrix: Option<&CachedMatrix>,
+    synthetic_mode: bool,
+    synth_scale: f32,
+) -> Result<(), K3Error> {
+    if let Some(cached) = cached_matrix {
+        if cached.rows() != expected_rows || cached.cols() != expected_cols {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: tensor_name.to_owned(),
+                offset: 0,
+                byte_len: out.len(),
+                buffer_len: expected_rows,
+                reason: format!(
+                    "{tensor_name} cached dims ({}, {}) != expected ({expected_rows}, {expected_cols})",
+                    cached.rows(),
+                    cached.cols()
+                ),
+            });
+        }
+        return cached.gemv_with_act_view(out, act_view, true);
+    }
+    if weights.tensor_count() > 0 || weights.contains_tensor(tensor_name) {
+        let tensor = weights.tensor(tensor_name)?;
+        let (rows, cols) = resolve_2d_dims(&tensor, expected_cols)?;
+        if rows != expected_rows {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: tensor_name.to_owned(),
+                offset: tensor.offset(),
+                byte_len: tensor.byte_len(),
+                buffer_len: tensor.as_bytes().len(),
+                reason: format!("{tensor_name} rows {rows} != expected {expected_rows}"),
+            });
+        }
+        let cached = get_or_repack(&tensor, rows, cols)?;
+        return cached.gemv_with_act_view(out, act_view, true);
+    }
+    if synthetic_mode {
+        fill_synthetic_proj(
+            out,
+            act_view.raw_f32(),
+            expected_rows,
+            expected_cols,
+            1,
+            synth_scale,
+        );
+        return Ok(());
+    }
+    Err(missing_tensor_err(tensor_name))
+}
+
 fn load_optional_proj_matrix(
     name: &str,
     expected_rows: usize,
     expected_cols: usize,
     label: &str,
     weights: &dyn ModelWeights,
-) -> Result<Option<std::sync::Arc<crate::repack_cache::CachedMatrix>>, K3Error> {
+) -> Result<Option<std::sync::Arc<CachedMatrix>>, K3Error> {
     if !weights.contains_tensor(name) {
         if weights.tensor_count() == 0 {
             return Ok(None);
@@ -1447,7 +2114,7 @@ fn load_optional_proj_matrix(
     reason = "projects Q, K, and V batches with reusable pre-quantized activation scratch"
 )]
 fn project_qkv_layer(
-    layer: usize,
+    keys: &LayerTensorKeys,
     norm_batch: &[f32],
     q_batch: &mut [f32],
     k_batch: &mut [f32],
@@ -1467,21 +2134,21 @@ fn project_qkv_layer(
     } else {
         (
             load_optional_proj_matrix(
-                &format!("blk.{layer}.attn_q.weight"),
+                &keys.attn_q,
                 geom.total_q,
                 geom.hidden_dim,
                 "attn_q",
                 weights,
             )?,
             load_optional_proj_matrix(
-                &format!("blk.{layer}.attn_k.weight"),
+                &keys.attn_k,
                 geom.total_kv,
                 geom.hidden_dim,
                 "attn_k",
                 weights,
             )?,
             load_optional_proj_matrix(
-                &format!("blk.{layer}.attn_v.weight"),
+                &keys.attn_v,
                 geom.total_kv,
                 geom.hidden_dim,
                 "attn_v",
@@ -1513,9 +2180,9 @@ fn project_qkv_layer(
     }
     add_optional_bias(
         q_batch,
-        &format!("blk.{layer}.attn_q.bias"),
+        &keys.attn_q_bias,
         layer_cache.and_then(|lc| lc.attn_q_bias.as_ref()),
-        layer_cache.is_some(),
+        layer_cache.map(|lc| lc.attn_q_bias.is_some()),
         geom.total_q,
         m,
         weights,
@@ -1528,9 +2195,9 @@ fn project_qkv_layer(
     }
     add_optional_bias(
         k_batch,
-        &format!("blk.{layer}.attn_k.bias"),
+        &keys.attn_k_bias,
         layer_cache.and_then(|lc| lc.attn_k_bias.as_ref()),
-        layer_cache.is_some(),
+        layer_cache.map(|lc| lc.attn_k_bias.is_some()),
         geom.total_kv,
         m,
         weights,
@@ -1543,9 +2210,9 @@ fn project_qkv_layer(
     }
     add_optional_bias(
         v_batch,
-        &format!("blk.{layer}.attn_v.bias"),
+        &keys.attn_v_bias,
         layer_cache.and_then(|lc| lc.attn_v_bias.as_ref()),
-        layer_cache.is_some(),
+        layer_cache.map(|lc| lc.attn_v_bias.is_some()),
         geom.total_kv,
         m,
         weights,
@@ -1716,7 +2383,7 @@ fn execute_layer_causal_gqa(
     reason = "executes batched gate, up, SwiGLU, and down FFN projections on preallocated workspaces"
 )]
 fn execute_layer_swiglu_ffn(
-    layer: usize,
+    keys: &LayerTensorKeys,
     norm_batch: &[f32],
     gate_batch: &mut [f32],
     up_batch: &mut [f32],
@@ -1739,21 +2406,21 @@ fn execute_layer_swiglu_ffn(
     } else {
         (
             load_optional_proj_matrix(
-                &format!("blk.{layer}.ffn_gate.weight"),
+                &keys.ffn_gate,
                 geom.ffn_dim,
                 geom.hidden_dim,
                 "ffn_gate",
                 weights,
             )?,
             load_optional_proj_matrix(
-                &format!("blk.{layer}.ffn_up.weight"),
+                &keys.ffn_up,
                 geom.ffn_dim,
                 geom.hidden_dim,
                 "ffn_up",
                 weights,
             )?,
             load_optional_proj_matrix(
-                &format!("blk.{layer}.ffn_down.weight"),
+                &keys.ffn_down,
                 geom.hidden_dim,
                 geom.ffn_dim,
                 "ffn_down",
@@ -1824,7 +2491,7 @@ fn add_optional_bias(
     batch: &mut [f32],
     bias_name: &str,
     cached_bias: Option<&Aligned128F32>,
-    has_layer_cache: bool,
+    bias_known_present: Option<bool>,
     dim: usize,
     m: usize,
     weights: &dyn ModelWeights,
@@ -1832,7 +2499,9 @@ fn add_optional_bias(
     let owned_fallback;
     let bias: &[f32] = if let Some(cached) = cached_bias {
         cached.as_slice()
-    } else if has_layer_cache || !weights.contains_tensor(bias_name) {
+    } else if bias_known_present == Some(false)
+        || (bias_known_present.is_none() && !weights.contains_tensor(bias_name))
+    {
         return Ok(());
     } else {
         let bias_tensor = weights.tensor(bias_name)?;
@@ -1888,6 +2557,108 @@ fn rmsnorm_row(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) -> R
     }
 }
 
+pub(crate) fn fill_inv_freq_compat(
+    head_dim: usize,
+    theta: f32,
+    scaling: Option<&RopeScalingConfig>,
+    seq_len: usize,
+    out: &mut [f32],
+) -> Result<(), K3Error> {
+    if head_dim == 0 || head_dim % 2 != 0 || !theta.is_finite() || theta <= 0.0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: "invalid RoPE parameters".to_owned(),
+        });
+    }
+    let half = head_dim / 2;
+    if out.len() != half {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: format!("inv_freq output len {} != half head_dim {half}", out.len()),
+        });
+    }
+    #[expect(clippy::cast_precision_loss, reason = "head_dim fits in f32")]
+    let hd_f32 = head_dim as f32;
+    for (i, slot) in out.iter_mut().enumerate() {
+        #[expect(clippy::cast_precision_loss, reason = "index fits in f32")]
+        let exp = (2 * i) as f32 / hd_f32;
+        *slot = 1.0_f32 / theta.powf(exp);
+    }
+
+    match scaling {
+        None => {}
+        Some(RopeScalingConfig::Linear { factor }) => {
+            if !factor.is_finite() || *factor <= 0.0 {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "rope".to_owned(),
+                    reason: "invalid linear RoPE scaling factor".to_owned(),
+                });
+            }
+            for freq in &mut *out {
+                *freq /= *factor;
+            }
+        }
+        Some(RopeScalingConfig::Llama3Smooth {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position_embeddings,
+        }) => {
+            if !factor.is_finite()
+                || *factor <= 0.0
+                || !low_freq_factor.is_finite()
+                || *low_freq_factor <= 0.0
+                || !high_freq_factor.is_finite()
+                || *high_freq_factor <= *low_freq_factor
+                || *original_max_position_embeddings == 0
+            {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "rope".to_owned(),
+                    reason: "invalid Llama-3 smooth RoPE scaling parameters".to_owned(),
+                });
+            }
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "context length fits accurately enough in f32 for wavelength band"
+            )]
+            let orig_ctx = *original_max_position_embeddings as f32;
+            let low_freq_wavelen = orig_ctx / *low_freq_factor;
+            let high_freq_wavelen = orig_ctx / *high_freq_factor;
+            for freq in &mut *out {
+                let wavelen = core::f32::consts::TAU / *freq;
+                if wavelen > low_freq_wavelen {
+                    *freq /= *factor;
+                } else if wavelen >= high_freq_wavelen {
+                    let smooth = (orig_ctx / wavelen - *low_freq_factor)
+                        / (*high_freq_factor - *low_freq_factor);
+                    *freq = (1.0_f32 - smooth) * (*freq / *factor) + smooth * (*freq);
+                }
+            }
+        }
+        Some(RopeScalingConfig::LongRope {
+            short_factor,
+            long_factor,
+            original_max_position_embeddings,
+        }) => {
+            let factors = if seq_len > *original_max_position_embeddings {
+                long_factor
+            } else {
+                short_factor
+            };
+            if factors.len() != half || factors.iter().any(|f| !f.is_finite() || *f <= 0.0) {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: "rope".to_owned(),
+                    reason: "invalid LongRoPE per-dimension scaling factor table".to_owned(),
+                });
+            }
+            for (freq, &factor) in out.iter_mut().zip(factors) {
+                *freq /= factor;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn precompute_inv_freq_compat(
     head_dim: usize,
     theta: f32,
@@ -1900,94 +2671,104 @@ pub(crate) fn precompute_inv_freq_compat(
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        if head_dim == 0 || head_dim % 2 != 0 || !theta.is_finite() || theta <= 0.0 {
-            return Err(K3Error::CapabilityMismatch {
-                architecture: "rope".to_owned(),
-                reason: "invalid RoPE parameters".to_owned(),
-            });
-        }
-        let half = head_dim / 2;
-        #[expect(clippy::cast_precision_loss, reason = "head_dim fits in f32")]
-        let hd_f32 = head_dim as f32;
-        let mut out = Vec::with_capacity(half);
-        for i in 0..half {
-            #[expect(clippy::cast_precision_loss, reason = "index fits in f32")]
-            let exp = (2 * i) as f32 / hd_f32;
-            out.push(1.0_f32 / theta.powf(exp));
-        }
+        let mut out = vec![0.0_f32; head_dim / 2];
+        fill_inv_freq_compat(head_dim, theta, scaling, seq_len, &mut out)?;
+        Ok(out)
+    }
+}
 
-        match scaling {
-            None => {}
-            Some(RopeScalingConfig::Linear { factor }) => {
-                if !factor.is_finite() || *factor <= 0.0 {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "rope".to_owned(),
-                        reason: "invalid linear RoPE scaling factor".to_owned(),
-                    });
+pub(crate) fn compute_rope_cos_sin_compat(
+    pos: usize,
+    rotary_dim: usize,
+    inv_freq: &[f32],
+    cos_out: &mut [f32],
+    sin_out: &mut [f32],
+) -> Result<(), K3Error> {
+    if rotary_dim < 2 || rotary_dim % 2 != 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: "rotary_dim must be positive and even".to_owned(),
+        });
+    }
+    let half = rotary_dim / 2;
+    if inv_freq.len() != half || cos_out.len() != half || sin_out.len() != half {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: "RoPE cos/sin scratch slice length mismatch".to_owned(),
+        });
+    }
+    #[cfg(feature = "with-kernels")]
+    {
+        compute_rope_cos_sin(pos, 10_000.0, 1.0, Some(inv_freq), cos_out, sin_out)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        #[expect(clippy::cast_precision_loss, reason = "pos fits in f32")]
+        let pos_f32 = pos as f32;
+        for i in 0..half {
+            let (s, c) = (pos_f32 * inv_freq[i]).sin_cos();
+            cos_out[i] = c;
+            sin_out[i] = s;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn apply_rope_with_cos_sin_compat(
+    qk: &mut [f32],
+    head_dim: usize,
+    rotary_dim: usize,
+    rope_type: RopeType,
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<(), K3Error> {
+    if head_dim < 2
+        || head_dim % 2 != 0
+        || rotary_dim < 2
+        || rotary_dim % 2 != 0
+        || rotary_dim > head_dim
+        || qk.len() % head_dim != 0
+        || cos.len() != rotary_dim / 2
+        || sin.len() != rotary_dim / 2
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: "invalid RoPE cos/sin slice bounds".to_owned(),
+        });
+    }
+    #[cfg(feature = "with-kernels")]
+    {
+        let num_heads = qk.len() / head_dim;
+        apply_rope_with_cos_sin(qk, num_heads, head_dim, rotary_dim, rope_type, cos, sin)
+    }
+    #[cfg(not(feature = "with-kernels"))]
+    {
+        let half = rotary_dim / 2;
+        for head in qk.chunks_exact_mut(head_dim) {
+            match rope_type {
+                RopeType::Norm => {
+                    for i in 0..half {
+                        let c = cos[i];
+                        let s = sin[i];
+                        let x0 = head[2 * i];
+                        let x1 = head[2 * i + 1];
+                        head[2 * i] = x0 * c - x1 * s;
+                        head[2 * i + 1] = x0 * s + x1 * c;
+                    }
                 }
-                for freq in &mut out {
-                    *freq /= *factor;
-                }
-            }
-            Some(RopeScalingConfig::Llama3Smooth {
-                factor,
-                low_freq_factor,
-                high_freq_factor,
-                original_max_position_embeddings,
-            }) => {
-                if !factor.is_finite()
-                    || *factor <= 0.0
-                    || !low_freq_factor.is_finite()
-                    || *low_freq_factor <= 0.0
-                    || !high_freq_factor.is_finite()
-                    || *high_freq_factor <= *low_freq_factor
-                    || *original_max_position_embeddings == 0
-                {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "rope".to_owned(),
-                        reason: "invalid Llama-3 smooth RoPE scaling parameters".to_owned(),
-                    });
-                }
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "context length fits accurately enough in f32 for wavelength band"
-                )]
-                let orig_ctx = *original_max_position_embeddings as f32;
-                let low_freq_wavelen = orig_ctx / *low_freq_factor;
-                let high_freq_wavelen = orig_ctx / *high_freq_factor;
-                for freq in &mut out {
-                    let wavelen = core::f32::consts::TAU / *freq;
-                    if wavelen > low_freq_wavelen {
-                        *freq /= *factor;
-                    } else if wavelen >= high_freq_wavelen {
-                        let smooth = (orig_ctx / wavelen - *low_freq_factor)
-                            / (*high_freq_factor - *low_freq_factor);
-                        *freq = (1.0_f32 - smooth) * (*freq / *factor) + smooth * (*freq);
+                RopeType::NeoX => {
+                    for i in 0..half {
+                        let c = cos[i];
+                        let s = sin[i];
+                        let x0 = head[i];
+                        let x1 = head[i + half];
+                        head[i] = x0 * c - x1 * s;
+                        head[i + half] = x0 * s + x1 * c;
                     }
                 }
             }
-            Some(RopeScalingConfig::LongRope {
-                short_factor,
-                long_factor,
-                original_max_position_embeddings,
-            }) => {
-                let factors = if seq_len > *original_max_position_embeddings {
-                    long_factor
-                } else {
-                    short_factor
-                };
-                if factors.len() != half || factors.iter().any(|f| !f.is_finite() || *f <= 0.0) {
-                    return Err(K3Error::CapabilityMismatch {
-                        architecture: "rope".to_owned(),
-                        reason: "invalid LongRoPE per-dimension scaling factor table".to_owned(),
-                    });
-                }
-                for (freq, &factor) in out.iter_mut().zip(factors) {
-                    *freq /= factor;
-                }
-            }
         }
-        Ok(out)
+        Ok(())
     }
 }
 

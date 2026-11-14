@@ -370,7 +370,7 @@ dependencies = [
 [[package]]
 name = "jero-kernels-rvv"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#ab301299893a2d2c8a47e54e354afe566faf27f4"
+source = "git+https://github.com/LMA1980/jero-kernels-rvv.git?branch=main#f3b2e650d6e45708335a2eaad98a8a5f51ff50e1"
 dependencies = [
  "jero-core",
 ]
