@@ -7,17 +7,28 @@
 //! multi-token `prefill_step` GEMMs, row-parallel multi-threading, and tied/untied `output.weight`.
 
 use jero_core::{
-    ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, ModelMetadata,
-    ModelWeights, QuantType, TensorDescriptor,
+    ArchRecipe, ExecutionContext, GgufArray, GgufFile, GgufValue, K3Error, KvCacheView, KvGeometry,
+    ModelMetadata, ModelWeights, QuantType, TensorDescriptor,
 };
 
 #[cfg(feature = "with-kernels")]
-pub use jero_kernels_rvv::RopeScalingConfig;
-#[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    BaselineKernel, VectorKernel, apply_rope_with_inv_freq, gqa_causal_attention_f32,
+    BaselineKernel, VectorKernel, apply_rope_with_inv_freq_and_layout, gqa_causal_attention_f32,
     precompute_rope_inv_freq, swiglu_f32,
 };
+#[cfg(feature = "with-kernels")]
+pub use jero_kernels_rvv::{RopeScalingConfig, RopeType};
+
+#[cfg(not(feature = "with-kernels"))]
+/// Memory layout convention for paired Rotary Position Embedding (`RoPE`) dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RopeType {
+    /// Interleaved adjacent pairs: `(v[2 * i], v[2 * i + 1])` (`LLAMA_ROPE_TYPE_NORM`).
+    Norm,
+    /// Split-half pairs: `(v[i], v[i + rotary_dim / 2])` (`LLAMA_ROPE_TYPE_NEOX`).
+    #[default]
+    NeoX,
+}
 
 #[cfg(not(feature = "with-kernels"))]
 /// Rotary position embedding scaling configurations.
@@ -79,6 +90,10 @@ pub struct LlamaRecipe {
     pub rms_eps: f32,
     /// Base rotary theta parameter ($\theta$).
     pub rope_theta: f32,
+    /// Rotary embedding pair convention (`Norm` for `llama`/`llama4`, `NeoX` for `qwen2`).
+    pub rope_type: RopeType,
+    /// Optional partial rotary dimension count (`{arch}.rope.dimension_count`, defaults to `head_dim`).
+    pub rotary_dim: Option<usize>,
     /// Optional rotary scaling configuration (e.g. Llama-3 Smooth `RoPE`).
     pub rope_scaling: Option<RopeScalingConfig>,
     /// Optional layer-by-layer boolean mask for Llama-4 iRoPE (skips `RoPE` on designated layers).
@@ -99,6 +114,7 @@ struct EffectiveGeometry {
     n_heads_q: usize,
     n_heads_kv: usize,
     head_d_even: usize,
+    rotary_dim: usize,
     total_q: usize,
     total_kv: usize,
 }
@@ -118,6 +134,8 @@ impl LlamaRecipe {
             vocab_size: 128_256,
             rms_eps: 1e-5,
             rope_theta: 500_000.0,
+            rope_type: RopeType::Norm,
+            rotary_dim: None,
             rope_scaling: None,
             irope_no_pos_mask: None,
         }
@@ -137,6 +155,8 @@ impl LlamaRecipe {
             vocab_size: 128_256,
             rms_eps: 1e-5,
             rope_theta: 500_000.0,
+            rope_type: RopeType::Norm,
+            rotary_dim: None,
             rope_scaling: None,
             irope_no_pos_mask: None,
         }
@@ -156,6 +176,8 @@ impl LlamaRecipe {
             vocab_size: 151_936,
             rms_eps: 1e-6,
             rope_theta: 1_000_000.0,
+            rope_type: RopeType::NeoX,
+            rotary_dim: None,
             rope_scaling: None,
             irope_no_pos_mask: None,
         }
@@ -194,12 +216,23 @@ impl LlamaRecipe {
         }
         if meta.head_count_kv() > 0 {
             recipe.n_heads_kv = meta.head_count_kv();
+        } else if let Some(&first_kv) = meta.head_count_kv_per_layer().iter().find(|&&v| v > 0) {
+            recipe.n_heads_kv = first_kv;
         }
 
-        if let Some(q_desc) = meta.find_tensor("blk.0.attn_q.weight")
+        if let Some(kd) = meta.key_length().filter(|&kd| kd >= 2) {
+            recipe.head_dim = kd;
+            if meta.head_count() == 0
+                && let Some(q_desc) = meta.find_tensor("blk.0.attn_q.weight")
+                && let Some(q_rows) = infer_descriptor_rows(q_desc, hidden_dim)
+                && q_rows % kd == 0
+            {
+                recipe.n_heads_q = q_rows / kd;
+            }
+        } else if let Some(q_desc) = meta.find_tensor("blk.0.attn_q.weight")
             && let Some(q_rows) = infer_descriptor_rows(q_desc, hidden_dim)
         {
-            if recipe.n_heads_q > 0 && q_rows % recipe.n_heads_q == 0 {
+            if meta.head_count() > 0 && q_rows % recipe.n_heads_q == 0 {
                 recipe.head_dim = q_rows / recipe.n_heads_q;
             } else if recipe.head_dim > 0 && q_rows % recipe.head_dim == 0 {
                 recipe.n_heads_q = q_rows / recipe.head_dim;
@@ -208,7 +241,8 @@ impl LlamaRecipe {
             recipe.head_dim = hidden_dim / recipe.n_heads_q;
         }
 
-        if let Some(k_desc) = meta.find_tensor("blk.0.attn_k.weight")
+        if meta.head_count_kv() == 0
+            && let Some(k_desc) = meta.find_tensor("blk.0.attn_k.weight")
             && let Some(k_rows) = infer_descriptor_rows(k_desc, hidden_dim)
             && recipe.head_dim > 0
             && k_rows % recipe.head_dim == 0
@@ -216,7 +250,9 @@ impl LlamaRecipe {
             recipe.n_heads_kv = k_rows / recipe.head_dim;
         }
 
-        if let Some(ffn_desc) = meta
+        if let Some(ffn) = meta.feed_forward_length().filter(|&v| v > 0) {
+            recipe.ffn_dim = ffn;
+        } else if let Some(ffn_desc) = meta
             .find_tensor("blk.0.ffn_gate.weight")
             .or_else(|| meta.find_tensor("blk.0.ffn_up.weight"))
             .or_else(|| meta.find_tensor("blk.0.ffn_down.weight"))
@@ -231,6 +267,20 @@ impl LlamaRecipe {
             && let Some(vocab_rows) = infer_descriptor_rows(vocab_desc, hidden_dim)
         {
             recipe.vocab_size = vocab_rows;
+        } else if let Some(vocab) = meta.vocab_size().filter(|&v| v > 0) {
+            recipe.vocab_size = vocab;
+        }
+
+        if let Some(eps) = meta.rms_norm_eps().filter(|e| e.is_finite() && *e > 0.0) {
+            recipe.rms_eps = eps;
+        }
+
+        if let Some(theta) = meta.rope_freq_base().filter(|t| t.is_finite() && *t > 0.0) {
+            recipe.rope_theta = theta;
+        }
+
+        if let Some(rd) = meta.rope_dimension_count() {
+            recipe.rotary_dim = Some(rd);
         }
 
         recipe
@@ -238,12 +288,13 @@ impl LlamaRecipe {
 
     /// Hydrates a [`LlamaRecipe`] from a full [`GgufFile`], reading architecture-prefixed KV
     /// entries (`feed_forward_length`, `attention.key_length`, `rope.freq_base`,
-    /// `attention.layer_norm_rms_epsilon`, `vocab_size`, `rope.scaling.*`) alongside tensor shapes.
+    /// `rope.dimension_count`, `attention.layer_norm_rms_epsilon`, `vocab_size`, `rope.scaling.*`)
+    /// alongside tensor shapes.
     ///
     /// # Errors
     ///
     /// Returns [`K3Error::CapabilityMismatch`] if `gguf.architecture()` is not `"llama"`,
-    /// `"llama4"`, or `"qwen2"`.
+    /// `"llama4"`, or `"qwen2"`, or if explicit `rope.scaling.*` metadata is malformed.
     pub fn from_gguf(gguf: &GgufFile<'_>) -> Result<Self, K3Error> {
         let arch = gguf.architecture();
         if !matches!(arch, "llama" | "llama4" | "qwen2") {
@@ -281,6 +332,14 @@ impl LlamaRecipe {
             recipe.rope_theta = theta;
         }
 
+        let rot_dim_key = format!("{arch}.rope.dimension_count");
+        if let Some(rd) = gguf
+            .metadata_value(&rot_dim_key)
+            .and_then(GgufValue::as_usize)
+        {
+            recipe.rotary_dim = Some(rd);
+        }
+
         let eps_key = format!("{arch}.attention.layer_norm_rms_epsilon");
         if let Some(eps) = gguf.metadata_value(&eps_key).and_then(GgufValue::as_f32)
             && eps.is_finite()
@@ -306,19 +365,7 @@ impl LlamaRecipe {
             }
         }
 
-        let scale_type_key = format!("{arch}.rope.scaling.type");
-        let scale_factor_key = format!("{arch}.rope.scaling.factor");
-        if let Some("linear") = gguf
-            .metadata_value(&scale_type_key)
-            .and_then(GgufValue::as_str)
-            && let Some(factor) = gguf
-                .metadata_value(&scale_factor_key)
-                .and_then(GgufValue::as_f32)
-            && factor.is_finite()
-            && factor > 0.0
-        {
-            recipe.rope_scaling = Some(RopeScalingConfig::Linear { factor });
-        }
+        recipe.rope_scaling = parse_rope_scaling_from_gguf(gguf, arch)?;
 
         let no_rope_step_key = format!("{arch}.attention.no_rope_layer_step");
         if let Some(step) = gguf
@@ -334,6 +381,29 @@ impl LlamaRecipe {
         }
 
         Ok(recipe)
+    }
+
+    /// Configures the `RoPE` pairing convention (`Norm` or `NeoX`).
+    #[must_use]
+    pub const fn with_rope_type(mut self, rope_type: RopeType) -> Self {
+        self.rope_type = rope_type;
+        self
+    }
+
+    /// Configures a partial or explicit rotary dimension count (`<= head_dim`).
+    #[must_use]
+    pub const fn with_rotary_dim(mut self, rotary_dim: usize) -> Self {
+        self.rotary_dim = Some(rotary_dim);
+        self
+    }
+
+    /// Returns the effective rotary dimension (`rotary_dim` if set, otherwise `head_dim`).
+    #[must_use]
+    pub const fn effective_rotary_dim(&self) -> usize {
+        match self.rotary_dim {
+            Some(rd) => rd,
+            None => self.head_dim,
+        }
     }
 
     /// Configures the Llama-4 iRoPE layer-by-layer positional embedding mask.
@@ -363,6 +433,21 @@ impl LlamaRecipe {
             .unwrap_or(false)
     }
 
+    fn resolve_rotary_dim(&self, head_d_even: usize) -> Result<usize, K3Error> {
+        let Some(rd) = self.rotary_dim else {
+            return Ok(head_d_even);
+        };
+        if rd < 2 || rd % 2 != 0 || rd > head_d_even {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture_id().to_owned(),
+                reason: format!(
+                    "invalid rotary_dim {rd} for head_dim {head_d_even} (must be even and within 2..={head_d_even})"
+                ),
+            });
+        }
+        Ok(rd)
+    }
+
     fn resolve_geometry(
         &self,
         weights: &dyn ModelWeights,
@@ -375,6 +460,7 @@ impl LlamaRecipe {
             let n_heads_kv = self.n_heads_kv.max(1);
             let hd = self.head_dim.max(2);
             let head_d_even = if hd % 2 == 0 { hd } else { hd - 1 };
+            let rotary_dim = self.resolve_rotary_dim(head_d_even)?;
             return Ok(EffectiveGeometry {
                 num_layers: self.num_layers,
                 hidden_dim,
@@ -382,15 +468,16 @@ impl LlamaRecipe {
                 n_heads_q,
                 n_heads_kv,
                 head_d_even,
+                rotary_dim,
                 total_q: n_heads_q * head_d_even,
                 total_kv: n_heads_kv * head_d_even,
             });
         }
 
         let hidden_dim = self.resolve_live_hidden_dim(weights, logits_len)?;
-        let num_layers = self.resolve_live_num_layers(weights);
-
+        let num_layers = Self::resolve_live_num_layers(weights)?;
         let (n_heads_q, n_heads_kv, head_d_even) = self.resolve_live_heads(weights, hidden_dim)?;
+        let rotary_dim = self.resolve_rotary_dim(head_d_even)?;
 
         let ffn_dim = if weights.contains_tensor("blk.0.ffn_gate.weight") {
             let t = weights.tensor("blk.0.ffn_gate.weight")?;
@@ -400,19 +487,34 @@ impl LlamaRecipe {
             resolve_2d_dims(&t, hidden_dim)?.0
         } else if weights.contains_tensor("blk.0.ffn_down.weight") {
             let t = weights.tensor("blk.0.ffn_down.weight")?;
-            // ffn_down maps ffn_dim -> hidden_dim, so hidden_dim is the output row axis
             let shape = t.shape();
             if shape.len() == 2 {
                 if shape[0] == hidden_dim {
                     shape[1]
-                } else {
+                } else if shape[1] == hidden_dim {
                     shape[0]
+                } else {
+                    return Err(K3Error::TensorBoundsError {
+                        tensor_name: "blk.0.ffn_down.weight".to_owned(),
+                        offset: t.offset(),
+                        byte_len: t.byte_len(),
+                        buffer_len: t.as_bytes().len(),
+                        reason: format!(
+                            "ffn_down shape {shape:?} does not match hidden_dim {hidden_dim}"
+                        ),
+                    });
                 }
             } else {
-                self.ffn_dim.max(16)
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "blk.0.ffn_down.weight".to_owned(),
+                    offset: t.offset(),
+                    byte_len: t.byte_len(),
+                    buffer_len: t.as_bytes().len(),
+                    reason: format!("expected 2D tensor for blk.0.ffn_down.weight, got {shape:?}"),
+                });
             }
         } else {
-            self.ffn_dim.max(16)
+            return Err(missing_tensor_err("blk.0.ffn_gate.weight"));
         };
 
         Ok(EffectiveGeometry {
@@ -422,6 +524,7 @@ impl LlamaRecipe {
             n_heads_q,
             n_heads_kv,
             head_d_even,
+            rotary_dim,
             total_q: n_heads_q * head_d_even,
             total_kv: n_heads_kv * head_d_even,
         })
@@ -474,10 +577,10 @@ impl LlamaRecipe {
                 return Ok(shape[0]);
             }
         }
-        Ok(self.hidden_dim.max(16))
+        Err(missing_tensor_err("blk.0.attn_norm.weight"))
     }
 
-    fn resolve_live_num_layers(&self, weights: &dyn ModelWeights) -> usize {
+    fn resolve_live_num_layers(weights: &dyn ModelWeights) -> Result<usize, K3Error> {
         let mut probed = 0_usize;
         for layer in 0..512 {
             let has_layer = weights.contains_tensor(&format!("blk.{layer}.attn_norm.weight"))
@@ -490,7 +593,11 @@ impl LlamaRecipe {
                 break;
             }
         }
-        if probed > 0 { probed } else { self.num_layers }
+        if probed > 0 {
+            Ok(probed)
+        } else {
+            Err(missing_tensor_err("blk.0.attn_norm.weight"))
+        }
     }
 
     fn resolve_live_heads(
@@ -503,19 +610,16 @@ impl LlamaRecipe {
             if d % 2 == 0 { d } else { d - 1 }
         };
         if !weights.contains_tensor("blk.0.attn_q.weight") {
-            let n_q = self.n_heads_q.max(1);
-            let n_kv = self.n_heads_kv.max(1);
-            return Ok((n_q, n_kv, hd_default));
+            return Err(missing_tensor_err("blk.0.attn_q.weight"));
+        }
+        if !weights.contains_tensor("blk.0.attn_k.weight") {
+            return Err(missing_tensor_err("blk.0.attn_k.weight"));
         }
 
         let q_tensor = weights.tensor("blk.0.attn_q.weight")?;
         let q_rows = resolve_2d_dims(&q_tensor, hidden_dim)?.0;
-        let k_rows = if weights.contains_tensor("blk.0.attn_k.weight") {
-            let k_tensor = weights.tensor("blk.0.attn_k.weight")?;
-            resolve_2d_dims(&k_tensor, hidden_dim)?.0
-        } else {
-            q_rows
-        };
+        let k_tensor = weights.tensor("blk.0.attn_k.weight")?;
+        let k_rows = resolve_2d_dims(&k_tensor, hidden_dim)?.0;
 
         let cur_q = self.n_heads_q.max(1);
         let cur_kv = self.n_heads_kv.max(1);
@@ -594,12 +698,14 @@ impl LlamaRecipe {
                 let dst = &mut hidden_batch[t_idx * hidden_dim..(t_idx + 1) * hidden_dim];
                 decode_row_to_f32(&emb_tensor, row_idx, hidden_dim, dst)?;
             }
-        } else {
+        } else if weights.tensor_count() == 0 {
             for (t_idx, &tok_id) in tokens.iter().enumerate() {
                 #[expect(clippy::cast_precision_loss, reason = "token_id modulo 17 fits in f32")]
                 let base_val = ((tok_id % 17) as f32) * 0.1 + 0.5;
                 hidden_batch[t_idx * hidden_dim..(t_idx + 1) * hidden_dim].fill(base_val);
             }
+        } else {
+            return Err(missing_tensor_err("token_embd.weight"));
         }
         Ok(())
     }
@@ -614,8 +720,11 @@ impl LlamaRecipe {
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
         if !weights.contains_tensor(norm_name) {
-            output.copy_from_slice(input);
-            return Ok(());
+            if weights.tensor_count() == 0 {
+                output.copy_from_slice(input);
+                return Ok(());
+            }
+            return Err(missing_tensor_err(norm_name));
         }
         let norm_tensor = weights.tensor(norm_name)?;
         let w_f32 = decode_1d_f32(&norm_tensor, dim, true)?;
@@ -638,6 +747,7 @@ impl LlamaRecipe {
         tokens: &[u32],
         start_pos: usize,
         kv_cache: &mut [f32],
+        kv_geometry: Option<KvGeometry>,
         weights: &dyn ModelWeights,
         logits_len: usize,
     ) -> Result<Vec<f32>, K3Error> {
@@ -647,12 +757,13 @@ impl LlamaRecipe {
             return Ok(vec![0.0_f32; geom.hidden_dim]);
         }
 
+        let synthetic_mode = weights.tensor_count() == 0;
         let end_pos = start_pos + m;
         let mut hidden_batch = vec![0.0_f32; m * geom.hidden_dim];
         Self::embed_tokens(tokens, &mut hidden_batch, geom.hidden_dim, weights)?;
 
         let inv_freq = precompute_inv_freq_compat(
-            geom.head_d_even,
+            geom.rotary_dim,
             self.rope_theta,
             self.rope_scaling.as_ref(),
             end_pos,
@@ -704,12 +815,16 @@ impl LlamaRecipe {
                     apply_rope_compat(
                         &mut q_batch[tok * geom.total_q..(tok + 1) * geom.total_q],
                         geom.head_d_even,
+                        geom.rotary_dim,
+                        self.rope_type,
                         pos,
                         &inv_freq,
                     )?;
                     apply_rope_compat(
                         &mut k_batch[tok * geom.total_kv..(tok + 1) * geom.total_kv],
                         geom.head_d_even,
+                        geom.rotary_dim,
+                        self.rope_type,
                         pos,
                         &inv_freq,
                     )?;
@@ -727,6 +842,8 @@ impl LlamaRecipe {
                 &k_batch,
                 &v_batch,
                 kv_cache,
+                kv_geometry,
+                synthetic_mode,
                 &mut attn_out_batch,
             )?;
 
@@ -759,7 +876,7 @@ impl LlamaRecipe {
                 for (h, &p) in hidden_batch.iter_mut().zip(&proj_hidden_batch) {
                     *h += p;
                 }
-            } else {
+            } else if synthetic_mode {
                 for tok in 0..m {
                     let h_row =
                         &mut hidden_batch[tok * geom.hidden_dim..(tok + 1) * geom.hidden_dim];
@@ -768,6 +885,8 @@ impl LlamaRecipe {
                         *h += a_row[i % geom.total_q] * 0.05;
                     }
                 }
+            } else {
+                return Err(missing_tensor_err(&attn_out_name));
             }
 
             // 6. Pre-FFN RMSNorm
@@ -826,6 +945,9 @@ impl LlamaRecipe {
             let layout = PhaseLayout::default();
             return project_lm_head_row_split(ctx.logits_mut(), hidden, &tied_weight, &layout);
         }
+        if weights.tensor_count() > 0 {
+            return Err(missing_tensor_err("output.weight"));
+        }
 
         let logits = ctx.logits_mut();
         if !logits.is_empty() {
@@ -859,10 +981,111 @@ impl ArchRecipe for LlamaRecipe {
                 | QuantType::F16
                 | QuantType::BF16
                 | QuantType::Q4_K_M
+                | QuantType::Q5_K
+                | QuantType::Q5_0
                 | QuantType::Q8_0
                 | QuantType::Q4_0
                 | QuantType::Q6_K
         )
+    }
+
+    fn validate_model(
+        &self,
+        metadata: &ModelMetadata,
+        weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        let arch = metadata.architecture();
+        if !matches!(arch, "llama" | "llama4" | "qwen2") {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!(
+                    "LlamaRecipe supports 'llama', 'llama4', and 'qwen2', got '{arch}'"
+                ),
+            });
+        }
+        if self.n_heads_kv == 0
+            || self.n_heads_q < self.n_heads_kv
+            || self.n_heads_q % self.n_heads_kv != 0
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!(
+                    "invalid GQA head counts: n_heads_q={} must be divisible by non-zero n_heads_kv={}",
+                    self.n_heads_q, self.n_heads_kv
+                ),
+            });
+        }
+
+        for desc in metadata.tensors() {
+            if !self.supports_quant(desc.quant()) {
+                return Err(K3Error::unsupported_tensor_quant(
+                    arch,
+                    desc.name(),
+                    desc.quant(),
+                ));
+            }
+            if weights.tensor_count() > 0
+                && let Ok(view) = weights.tensor(desc.name())
+                && !self.supports_quant(view.quant())
+            {
+                return Err(K3Error::unsupported_tensor_quant(
+                    arch,
+                    view.name(),
+                    view.quant(),
+                ));
+            }
+        }
+
+        if weights.tensor_count() == 0 {
+            let hd = self.head_dim.max(2);
+            let hd_even = if hd % 2 == 0 { hd } else { hd - 1 };
+            let _ = self.resolve_rotary_dim(hd_even)?;
+            return Ok(());
+        }
+
+        let geom = self.resolve_geometry(weights, 0)?;
+        let check_resident = |name: &str| -> Result<(), K3Error> {
+            let view = weights.tensor(name)?;
+            if !self.supports_quant(view.quant()) {
+                return Err(K3Error::unsupported_tensor_quant(arch, name, view.quant()));
+            }
+            Ok(())
+        };
+
+        check_resident("token_embd.weight")?;
+        check_resident("output_norm.weight")?;
+        if weights.contains_tensor("output.weight") {
+            check_resident("output.weight")?;
+        }
+
+        for layer in 0..geom.num_layers {
+            for suffix in [
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_norm.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ] {
+                check_resident(&format!("blk.{layer}.{suffix}"))?;
+            }
+            for opt_bias in [
+                "attn_q.bias",
+                "attn_k.bias",
+                "attn_v.bias",
+                "attn_output.bias",
+            ] {
+                let name = format!("blk.{layer}.{opt_bias}");
+                if weights.contains_tensor(&name) {
+                    check_resident(&name)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn prefill_step(
@@ -887,10 +1110,12 @@ impl ArchRecipe for LlamaRecipe {
         }
 
         let logits_len = ctx.logits().len();
+        let kv_geometry = ctx.kv_geometry();
         let last_hidden = self.execute_batch_forward(
             &prompt_tokens,
             start_pos,
             ctx.kv_cache_mut(),
+            kv_geometry,
             weights,
             logits_len,
         )?;
@@ -919,12 +1144,46 @@ impl ArchRecipe for LlamaRecipe {
         }
 
         let logits_len = ctx.logits().len();
+        let kv_geometry = ctx.kv_geometry();
         let single = [token];
-        let hidden =
-            self.execute_batch_forward(&single, pos, ctx.kv_cache_mut(), weights, logits_len)?;
+        let hidden = self.execute_batch_forward(
+            &single,
+            pos,
+            ctx.kv_cache_mut(),
+            kv_geometry,
+            weights,
+            logits_len,
+        )?;
         ctx.advance_position(1)?;
         Self::project_logits(ctx, &hidden, weights, Some(token))
     }
+}
+
+fn load_optional_proj_matrix(
+    name: &str,
+    expected_rows: usize,
+    expected_cols: usize,
+    label: &str,
+    weights: &dyn ModelWeights,
+) -> Result<Option<std::sync::Arc<crate::repack_cache::CachedMatrix>>, K3Error> {
+    if !weights.contains_tensor(name) {
+        if weights.tensor_count() == 0 {
+            return Ok(None);
+        }
+        return Err(missing_tensor_err(name));
+    }
+    let t = weights.tensor(name)?;
+    let (rows, cols) = resolve_2d_dims(&t, expected_cols)?;
+    if rows != expected_rows {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: name.to_owned(),
+            offset: t.offset(),
+            byte_len: t.byte_len(),
+            buffer_len: t.as_bytes().len(),
+            reason: format!("{label} rows {rows} != expected {expected_rows}"),
+        });
+    }
+    Ok(Some(get_or_repack(&t, rows, cols)?))
 }
 
 #[expect(
@@ -941,60 +1200,27 @@ fn project_qkv_layer(
     m: usize,
     weights: &dyn ModelWeights,
 ) -> Result<(), K3Error> {
-    let q_name = format!("blk.{layer}.attn_q.weight");
-    let k_name = format!("blk.{layer}.attn_k.weight");
-    let v_name = format!("blk.{layer}.attn_v.weight");
-
-    let q_mat = if weights.contains_tensor(&q_name) {
-        let t = weights.tensor(&q_name)?;
-        let (rows, cols) = resolve_2d_dims(&t, geom.hidden_dim)?;
-        if rows != geom.total_q {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: q_name,
-                offset: t.offset(),
-                byte_len: t.byte_len(),
-                buffer_len: t.as_bytes().len(),
-                reason: format!("attn_q rows {rows} != total_q {}", geom.total_q),
-            });
-        }
-        Some(get_or_repack(&t, rows, cols)?)
-    } else {
-        None
-    };
-
-    let k_mat = if weights.contains_tensor(&k_name) {
-        let t = weights.tensor(&k_name)?;
-        let (rows, cols) = resolve_2d_dims(&t, geom.hidden_dim)?;
-        if rows != geom.total_kv {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: k_name,
-                offset: t.offset(),
-                byte_len: t.byte_len(),
-                buffer_len: t.as_bytes().len(),
-                reason: format!("attn_k rows {rows} != total_kv {}", geom.total_kv),
-            });
-        }
-        Some(get_or_repack(&t, rows, cols)?)
-    } else {
-        None
-    };
-
-    let v_mat = if weights.contains_tensor(&v_name) {
-        let t = weights.tensor(&v_name)?;
-        let (rows, cols) = resolve_2d_dims(&t, geom.hidden_dim)?;
-        if rows != geom.total_kv {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: v_name,
-                offset: t.offset(),
-                byte_len: t.byte_len(),
-                buffer_len: t.as_bytes().len(),
-                reason: format!("attn_v rows {rows} != total_kv {}", geom.total_kv),
-            });
-        }
-        Some(get_or_repack(&t, rows, cols)?)
-    } else {
-        None
-    };
+    let q_mat = load_optional_proj_matrix(
+        &format!("blk.{layer}.attn_q.weight"),
+        geom.total_q,
+        geom.hidden_dim,
+        "attn_q",
+        weights,
+    )?;
+    let k_mat = load_optional_proj_matrix(
+        &format!("blk.{layer}.attn_k.weight"),
+        geom.total_kv,
+        geom.hidden_dim,
+        "attn_k",
+        weights,
+    )?;
+    let v_mat = load_optional_proj_matrix(
+        &format!("blk.{layer}.attn_v.weight"),
+        geom.total_kv,
+        geom.hidden_dim,
+        "attn_v",
+        weights,
+    )?;
 
     let shared_group = q_mat
         .as_ref()
@@ -1046,6 +1272,64 @@ fn project_qkv_layer(
     Ok(())
 }
 
+fn resolve_kv_geometry(
+    geom: EffectiveGeometry,
+    end_pos: usize,
+    kv_cache_len: usize,
+    kv_cache_bytes: usize,
+    kv_geometry: Option<KvGeometry>,
+    synthetic_mode: bool,
+) -> Result<Option<KvGeometry>, K3Error> {
+    if let Some(ctx_geom) = kv_geometry {
+        if ctx_geom.num_layers != geom.num_layers
+            || ctx_geom.n_heads_kv != geom.n_heads_kv
+            || ctx_geom.head_dim != geom.head_d_even
+        {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "kv_cache".to_owned(),
+                reason: format!(
+                    "ExecutionContext KvGeometry ({}, {}, {}) does not match model geometry ({}, {}, {})",
+                    ctx_geom.num_layers,
+                    ctx_geom.n_heads_kv,
+                    ctx_geom.head_dim,
+                    geom.num_layers,
+                    geom.n_heads_kv,
+                    geom.head_d_even
+                ),
+            });
+        }
+        return Ok(Some(ctx_geom));
+    }
+
+    let per_tok_all_layers = 2_usize
+        .checked_mul(geom.num_layers)
+        .and_then(|v| v.checked_mul(geom.total_kv))
+        .unwrap_or(0);
+    let required = end_pos.saturating_mul(per_tok_all_layers);
+    if per_tok_all_layers > 0 && kv_cache_len >= required {
+        let seq_cap = kv_cache_len / per_tok_all_layers;
+        Ok(Some(KvGeometry::new(
+            geom.num_layers,
+            geom.n_heads_kv,
+            geom.head_d_even,
+            seq_cap,
+            None,
+        )?))
+    } else if !synthetic_mode {
+        Err(K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: 0,
+            byte_len: required.saturating_mul(size_of::<f32>()),
+            buffer_len: kv_cache_bytes,
+            reason: format!(
+                "kv_cache length {kv_cache_len} f32 elements is smaller than required {required} for end_pos={end_pos}"
+            ),
+        })
+    } else {
+        Ok(None)
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "manages layer KV cache slice partitioning and batched causal GQA execution"
@@ -1060,27 +1344,29 @@ fn execute_layer_causal_gqa(
     k_batch: &[f32],
     v_batch: &[f32],
     kv_cache: &mut [f32],
+    kv_geometry: Option<KvGeometry>,
+    synthetic_mode: bool,
     attn_out_batch: &mut [f32],
 ) -> Result<(), K3Error> {
     let end_pos = start_pos + m;
-    let per_tok_all_layers = 2_usize
-        .saturating_mul(geom.num_layers)
-        .saturating_mul(geom.total_kv);
+    let resolved_geom = resolve_kv_geometry(
+        geom,
+        end_pos,
+        kv_cache.len(),
+        size_of_val(kv_cache),
+        kv_geometry,
+        synthetic_mode,
+    )?;
 
-    if per_tok_all_layers > 0 && kv_cache.len() >= end_pos.saturating_mul(per_tok_all_layers) {
-        let seq_cap = kv_cache.len() / per_tok_all_layers;
-        let layer_len = 2 * seq_cap * geom.total_kv;
-        let layer_slice = &mut kv_cache[layer * layer_len..(layer + 1) * layer_len];
-        let (k_layer, v_layer) = layer_slice.split_at_mut(seq_cap * geom.total_kv);
+    if let Some(view_geom) = resolved_geom {
+        let mut kv_view = KvCacheView::new(kv_cache, view_geom)?;
+        for tok in 0..m {
+            let (k_slot, v_slot) = kv_view.write_pos_range(layer, start_pos + tok)?;
+            k_slot.copy_from_slice(&k_batch[tok * geom.total_kv..(tok + 1) * geom.total_kv]);
+            v_slot.copy_from_slice(&v_batch[tok * geom.total_kv..(tok + 1) * geom.total_kv]);
+        }
 
-        let write_start = start_pos * geom.total_kv;
-        let write_end = end_pos * geom.total_kv;
-        k_layer[write_start..write_end].copy_from_slice(k_batch);
-        v_layer[write_start..write_end].copy_from_slice(v_batch);
-
-        let k_valid = &k_layer[..write_end];
-        let v_valid = &v_layer[..write_end];
-
+        let kv_view_ref = &kv_view;
         #[cfg(not(miri))]
         if m >= 2 && rayon::current_num_threads() > 1 {
             use rayon::prelude::*;
@@ -1088,13 +1374,15 @@ fn execute_layer_causal_gqa(
                 .par_chunks_mut(geom.total_q)
                 .enumerate()
                 .try_for_each(|(tok, out_tok)| {
-                    let cur_seq_len = start_pos + tok + 1;
+                    let cur_end = start_pos + tok + 1;
+                    let (k_valid, v_valid) = kv_view_ref.valid_kv_range(layer, cur_end)?;
+                    let cur_seq_len = k_valid.len() / geom.total_kv;
                     let q_tok = &q_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
                     gqa_attention_compat(
                         out_tok,
                         q_tok,
-                        &k_valid[..cur_seq_len * geom.total_kv],
-                        &v_valid[..cur_seq_len * geom.total_kv],
+                        k_valid,
+                        v_valid,
                         geom.n_heads_q,
                         geom.n_heads_kv,
                         geom.head_d_even,
@@ -1105,14 +1393,16 @@ fn execute_layer_causal_gqa(
         }
 
         for tok in 0..m {
-            let cur_seq_len = start_pos + tok + 1;
+            let cur_end = start_pos + tok + 1;
+            let (k_valid, v_valid) = kv_view_ref.valid_kv_range(layer, cur_end)?;
+            let cur_seq_len = k_valid.len() / geom.total_kv;
             let q_tok = &q_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
             let out_tok = &mut attn_out_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
             gqa_attention_compat(
                 out_tok,
                 q_tok,
-                &k_valid[..cur_seq_len * geom.total_kv],
-                &v_valid[..cur_seq_len * geom.total_kv],
+                k_valid,
+                v_valid,
                 geom.n_heads_q,
                 geom.n_heads_kv,
                 geom.head_d_even,
@@ -1177,43 +1467,20 @@ fn execute_layer_swiglu_ffn(
     m: usize,
     weights: &dyn ModelWeights,
 ) -> Result<(), K3Error> {
-    let gate_name = format!("blk.{layer}.ffn_gate.weight");
-    let up_name = format!("blk.{layer}.ffn_up.weight");
-    let down_name = format!("blk.{layer}.ffn_down.weight");
-
-    let gate_mat = if weights.contains_tensor(&gate_name) {
-        let t = weights.tensor(&gate_name)?;
-        let (rows, cols) = resolve_2d_dims(&t, geom.hidden_dim)?;
-        if rows != geom.ffn_dim {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: gate_name,
-                offset: t.offset(),
-                byte_len: t.byte_len(),
-                buffer_len: t.as_bytes().len(),
-                reason: format!("ffn_gate rows {rows} != ffn_dim {}", geom.ffn_dim),
-            });
-        }
-        Some(get_or_repack(&t, rows, cols)?)
-    } else {
-        None
-    };
-
-    let up_mat = if weights.contains_tensor(&up_name) {
-        let t = weights.tensor(&up_name)?;
-        let (rows, cols) = resolve_2d_dims(&t, geom.hidden_dim)?;
-        if rows != geom.ffn_dim {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: up_name,
-                offset: t.offset(),
-                byte_len: t.byte_len(),
-                buffer_len: t.as_bytes().len(),
-                reason: format!("ffn_up rows {rows} != ffn_dim {}", geom.ffn_dim),
-            });
-        }
-        Some(get_or_repack(&t, rows, cols)?)
-    } else {
-        None
-    };
+    let gate_mat = load_optional_proj_matrix(
+        &format!("blk.{layer}.ffn_gate.weight"),
+        geom.ffn_dim,
+        geom.hidden_dim,
+        "ffn_gate",
+        weights,
+    )?;
+    let up_mat = load_optional_proj_matrix(
+        &format!("blk.{layer}.ffn_up.weight"),
+        geom.ffn_dim,
+        geom.hidden_dim,
+        "ffn_up",
+        weights,
+    )?;
 
     let shared_group = gate_mat
         .as_ref()
@@ -1243,19 +1510,13 @@ fn execute_layer_swiglu_ffn(
 
     swiglu_compat(ffn_act_batch, gate_batch, up_batch)?;
 
-    if weights.contains_tensor(&down_name) {
-        let down_tensor = weights.tensor(&down_name)?;
-        let (rows, cols) = resolve_2d_dims(&down_tensor, geom.ffn_dim)?;
-        if rows != geom.hidden_dim {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: down_name,
-                offset: down_tensor.offset(),
-                byte_len: down_tensor.byte_len(),
-                buffer_len: down_tensor.as_bytes().len(),
-                reason: format!("ffn_down rows {rows} != hidden_dim {}", geom.hidden_dim),
-            });
-        }
-        let cached = get_or_repack(&down_tensor, rows, cols)?;
+    if let Some(cached) = load_optional_proj_matrix(
+        &format!("blk.{layer}.ffn_down.weight"),
+        geom.hidden_dim,
+        geom.ffn_dim,
+        "ffn_down",
+        weights,
+    )? {
         cached.project_batch(proj_hidden_batch, ffn_act_batch, m, true)?;
         for (h, &p) in hidden_batch.iter_mut().zip(&*proj_hidden_batch) {
             *h += p;
@@ -1334,7 +1595,7 @@ fn rmsnorm_row(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) -> R
     }
 }
 
-fn precompute_inv_freq_compat(
+pub(crate) fn precompute_inv_freq_compat(
     head_dim: usize,
     theta: f32,
     scaling: Option<&RopeScalingConfig>,
@@ -1346,7 +1607,6 @@ fn precompute_inv_freq_compat(
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        let _ = (scaling, seq_len);
         if head_dim == 0 || head_dim % 2 != 0 || !theta.is_finite() || theta <= 0.0 {
             return Err(K3Error::CapabilityMismatch {
                 architecture: "rope".to_owned(),
@@ -1362,26 +1622,103 @@ fn precompute_inv_freq_compat(
             let exp = (2 * i) as f32 / hd_f32;
             out.push(1.0_f32 / theta.powf(exp));
         }
+
+        match scaling {
+            None => {}
+            Some(RopeScalingConfig::Linear { factor }) => {
+                if !factor.is_finite() || *factor <= 0.0 {
+                    return Err(K3Error::CapabilityMismatch {
+                        architecture: "rope".to_owned(),
+                        reason: "invalid linear RoPE scaling factor".to_owned(),
+                    });
+                }
+                for freq in &mut out {
+                    *freq /= *factor;
+                }
+            }
+            Some(RopeScalingConfig::Llama3Smooth {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings,
+            }) => {
+                if !factor.is_finite()
+                    || *factor <= 0.0
+                    || !low_freq_factor.is_finite()
+                    || *low_freq_factor <= 0.0
+                    || !high_freq_factor.is_finite()
+                    || *high_freq_factor <= *low_freq_factor
+                    || *original_max_position_embeddings == 0
+                {
+                    return Err(K3Error::CapabilityMismatch {
+                        architecture: "rope".to_owned(),
+                        reason: "invalid Llama-3 smooth RoPE scaling parameters".to_owned(),
+                    });
+                }
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "context length fits accurately enough in f32 for wavelength band"
+                )]
+                let orig_ctx = *original_max_position_embeddings as f32;
+                let low_freq_wavelen = orig_ctx / *low_freq_factor;
+                let high_freq_wavelen = orig_ctx / *high_freq_factor;
+                for freq in &mut out {
+                    let wavelen = core::f32::consts::TAU / *freq;
+                    if wavelen > low_freq_wavelen {
+                        *freq /= *factor;
+                    } else if wavelen >= high_freq_wavelen {
+                        let smooth = (orig_ctx / wavelen - *low_freq_factor)
+                            / (*high_freq_factor - *low_freq_factor);
+                        *freq = (1.0_f32 - smooth) * (*freq / *factor) + smooth * (*freq);
+                    }
+                }
+            }
+            Some(RopeScalingConfig::LongRope {
+                short_factor,
+                long_factor,
+                original_max_position_embeddings,
+            }) => {
+                let factors = if seq_len > *original_max_position_embeddings {
+                    long_factor
+                } else {
+                    short_factor
+                };
+                if factors.len() != half || factors.iter().any(|f| !f.is_finite() || *f <= 0.0) {
+                    return Err(K3Error::CapabilityMismatch {
+                        architecture: "rope".to_owned(),
+                        reason: "invalid LongRoPE per-dimension scaling factor table".to_owned(),
+                    });
+                }
+                for (freq, &factor) in out.iter_mut().zip(factors) {
+                    *freq /= factor;
+                }
+            }
+        }
         Ok(out)
     }
 }
 
-fn apply_rope_compat(
+pub(crate) fn apply_rope_compat(
     qk: &mut [f32],
     head_dim: usize,
+    rotary_dim: usize,
+    rope_type: RopeType,
     pos: usize,
     inv_freq: &[f32],
 ) -> Result<(), K3Error> {
     #[cfg(feature = "with-kernels")]
     {
-        apply_rope_with_inv_freq(qk, head_dim, pos, inv_freq)
+        apply_rope_with_inv_freq_and_layout(qk, head_dim, rotary_dim, rope_type, pos, inv_freq)
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        if head_dim == 0
+        if head_dim < 2
             || head_dim % 2 != 0
+            || rotary_dim < 2
+            || rotary_dim % 2 != 0
+            || rotary_dim > head_dim
             || qk.len() % head_dim != 0
-            || inv_freq.len() != head_dim / 2
+            || inv_freq.len() != rotary_dim / 2
         {
             return Err(K3Error::CapabilityMismatch {
                 architecture: "rope".to_owned(),
@@ -1391,17 +1728,31 @@ fn apply_rope_compat(
         if pos == 0 {
             return Ok(());
         }
-        let half = head_dim / 2;
+        let half = rotary_dim / 2;
         #[expect(clippy::cast_precision_loss, reason = "pos fits in f32")]
         let pos_f32 = pos as f32;
         for head in qk.chunks_exact_mut(head_dim) {
-            for i in 0..half {
-                let angle = pos_f32 * inv_freq[i];
-                let (s, c) = angle.sin_cos();
-                let x1 = head[i];
-                let x2 = head[i + half];
-                head[i] = x1 * c - x2 * s;
-                head[i + half] = x1 * s + x2 * c;
+            match rope_type {
+                RopeType::Norm => {
+                    for i in 0..half {
+                        let angle = pos_f32 * inv_freq[i];
+                        let (s, c) = angle.sin_cos();
+                        let x0 = head[2 * i];
+                        let x1 = head[2 * i + 1];
+                        head[2 * i] = x0 * c - x1 * s;
+                        head[2 * i + 1] = x0 * s + x1 * c;
+                    }
+                }
+                RopeType::NeoX => {
+                    for i in 0..half {
+                        let angle = pos_f32 * inv_freq[i];
+                        let (s, c) = angle.sin_cos();
+                        let x0 = head[i];
+                        let x1 = head[i + half];
+                        head[i] = x0 * c - x1 * s;
+                        head[i + half] = x0 * s + x1 * c;
+                    }
+                }
             }
         }
         Ok(())
@@ -1558,4 +1909,257 @@ const fn gcd_usize(mut a: usize, mut b: usize) -> usize {
         b = r;
     }
     a
+}
+
+fn missing_tensor_err(tensor_name: &str) -> K3Error {
+    K3Error::TensorBoundsError {
+        tensor_name: tensor_name.to_owned(),
+        offset: 0,
+        byte_len: 0,
+        buffer_len: 0,
+        reason: format!("missing required tensor '{tensor_name}'"),
+    }
+}
+
+fn read_positive_f32_meta(gguf: &GgufFile<'_>, key: &str) -> Result<Option<f32>, K3Error> {
+    let Some(val) = gguf.metadata_value(key) else {
+        return Ok(None);
+    };
+    let Some(num) = val.as_f32() else {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: gguf.architecture().to_owned(),
+            reason: format!("expected numeric GGUF metadata value for '{key}'"),
+        });
+    };
+    if !num.is_finite() || num <= 0.0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: gguf.architecture().to_owned(),
+            reason: format!("expected finite positive f32 for '{key}', got {num}"),
+        });
+    }
+    Ok(Some(num))
+}
+
+fn read_orig_ctx_len_meta(gguf: &GgufFile<'_>, arch: &str) -> Result<Option<usize>, K3Error> {
+    for suffix in [
+        "rope.scaling.original_context_length",
+        "rope.scaling.orig_ctx_len",
+        "rope.scaling.original_max_position_embeddings",
+    ] {
+        let key = format!("{arch}.{suffix}");
+        if let Some(val) = gguf.metadata_value(&key) {
+            let Some(len) = val.as_usize() else {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: arch.to_owned(),
+                    reason: format!("expected integer GGUF metadata value for '{key}'"),
+                });
+            };
+            if len == 0 {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: arch.to_owned(),
+                    reason: format!("expected non-zero context length for '{key}'"),
+                });
+            }
+            return Ok(Some(len));
+        }
+    }
+    Ok(None)
+}
+
+fn read_f32_array_meta(gguf: &GgufFile<'_>, key: &str) -> Result<Option<Vec<f32>>, K3Error> {
+    let Some(val) = gguf.metadata_value(key) else {
+        return Ok(None);
+    };
+    let GgufValue::Array(arr) = val else {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: gguf.architecture().to_owned(),
+            reason: format!("expected array for GGUF metadata key '{key}'"),
+        });
+    };
+    let out: Vec<f32> = match arr {
+        GgufArray::Float32(v) => v.clone(),
+        GgufArray::Float64(v) =>
+        {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "RoPE scaling factors are small positive constants representable in f32"
+            )]
+            v.iter().map(|&x| x as f32).collect()
+        }
+        GgufArray::Int32(v) =>
+        {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "small integer RoPE factors convert to f32"
+            )]
+            v.iter().map(|&x| x as f32).collect()
+        }
+        GgufArray::Uint32(v) =>
+        {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "small integer RoPE factors convert to f32"
+            )]
+            v.iter().map(|&x| x as f32).collect()
+        }
+        _ => {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: gguf.architecture().to_owned(),
+                reason: format!("expected numeric array for GGUF metadata key '{key}'"),
+            });
+        }
+    };
+    if out.is_empty() || out.iter().any(|x| !x.is_finite() || *x <= 0.0) {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: gguf.architecture().to_owned(),
+            reason: format!("GGUF key '{key}' contains empty or invalid non-positive RoPE factors"),
+        });
+    }
+    Ok(Some(out))
+}
+
+fn build_long_rope_from_tables(
+    arch: &str,
+    short: Option<Vec<f32>>,
+    long: Option<Vec<f32>>,
+    factors: Option<Vec<f32>>,
+    orig_ctx: usize,
+) -> Result<RopeScalingConfig, K3Error> {
+    match (short, long, factors) {
+        (Some(short_factor), Some(long_factor), _) => {
+            if short_factor.len() != long_factor.len() {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: arch.to_owned(),
+                    reason: format!(
+                        "LongRoPE short_factor len {} != long_factor len {}",
+                        short_factor.len(),
+                        long_factor.len()
+                    ),
+                });
+            }
+            Ok(RopeScalingConfig::LongRope {
+                short_factor,
+                long_factor,
+                original_max_position_embeddings: orig_ctx,
+            })
+        }
+        (None, Some(long_factor), _) => Ok(RopeScalingConfig::LongRope {
+            short_factor: vec![1.0_f32; long_factor.len()],
+            long_factor,
+            original_max_position_embeddings: orig_ctx,
+        }),
+        (Some(short_factor), None, None) => Ok(RopeScalingConfig::LongRope {
+            long_factor: short_factor.clone(),
+            short_factor,
+            original_max_position_embeddings: orig_ctx,
+        }),
+        (_, _, Some(factors)) => Ok(RopeScalingConfig::LongRope {
+            short_factor: factors.clone(),
+            long_factor: factors,
+            original_max_position_embeddings: orig_ctx,
+        }),
+        (None, None, None) => Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: "missing LongRoPE scaling factor tables in GGUF metadata".to_owned(),
+        }),
+    }
+}
+
+fn parse_rope_scaling_from_gguf(
+    gguf: &GgufFile<'_>,
+    arch: &str,
+) -> Result<Option<RopeScalingConfig>, K3Error> {
+    let type_key = format!("{arch}.rope.scaling.type");
+    let scaling_type = match gguf.metadata_value(&type_key) {
+        Some(val) => Some(val.as_str().ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("expected string value for GGUF metadata key '{type_key}'"),
+        })?),
+        None => None,
+    };
+
+    let factor = read_positive_f32_meta(gguf, &format!("{arch}.rope.scaling.factor"))?;
+    let low_freq = read_positive_f32_meta(gguf, &format!("{arch}.rope.scaling.low_freq_factor"))?;
+    let high_freq = read_positive_f32_meta(gguf, &format!("{arch}.rope.scaling.high_freq_factor"))?;
+    let orig_ctx_opt = read_orig_ctx_len_meta(gguf, arch)?;
+    let short_tbl = read_f32_array_meta(gguf, &format!("{arch}.rope.scaling.short_factor"))?;
+    let long_tbl = read_f32_array_meta(gguf, &format!("{arch}.rope.scaling.long_factor"))?;
+    let factors_tbl = read_f32_array_meta(gguf, &format!("{arch}.rope.scaling.factors"))?;
+
+    match scaling_type {
+        Some("none" | "") => Ok(None),
+        Some("linear") => {
+            let factor = factor.ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!("missing '{arch}.rope.scaling.factor' for linear RoPE scaling"),
+            })?;
+            Ok(Some(RopeScalingConfig::Linear { factor }))
+        }
+        Some("llama3") => {
+            let factor = factor.ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: arch.to_owned(),
+                reason: format!("missing '{arch}.rope.scaling.factor' for llama3 RoPE scaling"),
+            })?;
+            let low_freq_factor = low_freq.unwrap_or(1.0);
+            let high_freq_factor = high_freq.unwrap_or(4.0);
+            if high_freq_factor <= low_freq_factor {
+                return Err(K3Error::CapabilityMismatch {
+                    architecture: arch.to_owned(),
+                    reason: format!(
+                        "invalid llama3 RoPE frequency bounds: low={low_freq_factor}, high={high_freq_factor}"
+                    ),
+                });
+            }
+            Ok(Some(RopeScalingConfig::Llama3Smooth {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings: orig_ctx_opt.unwrap_or(8192),
+            }))
+        }
+        Some("longrope" | "yarn" | "su") => Ok(Some(build_long_rope_from_tables(
+            arch,
+            short_tbl,
+            long_tbl,
+            factors_tbl,
+            orig_ctx_opt.unwrap_or(8192),
+        )?)),
+        Some(other) => Err(K3Error::CapabilityMismatch {
+            architecture: arch.to_owned(),
+            reason: format!("unsupported RoPE scaling type '{other}'"),
+        }),
+        None => {
+            if short_tbl.is_some() || long_tbl.is_some() || factors_tbl.is_some() {
+                return Ok(Some(build_long_rope_from_tables(
+                    arch,
+                    short_tbl,
+                    long_tbl,
+                    factors_tbl,
+                    orig_ctx_opt.unwrap_or(8192),
+                )?));
+            }
+            if let Some(factor) = factor {
+                if low_freq.is_some() || high_freq.is_some() || orig_ctx_opt.is_some() {
+                    let low_freq_factor = low_freq.unwrap_or(1.0);
+                    let high_freq_factor = high_freq.unwrap_or(4.0);
+                    if high_freq_factor <= low_freq_factor {
+                        return Err(K3Error::CapabilityMismatch {
+                            architecture: arch.to_owned(),
+                            reason: format!(
+                                "invalid llama3 RoPE frequency bounds: low={low_freq_factor}, high={high_freq_factor}"
+                            ),
+                        });
+                    }
+                    return Ok(Some(RopeScalingConfig::Llama3Smooth {
+                        factor,
+                        low_freq_factor,
+                        high_freq_factor,
+                        original_max_position_embeddings: orig_ctx_opt.unwrap_or(8192),
+                    }));
+                }
+                return Ok(Some(RopeScalingConfig::Linear { factor }));
+            }
+            Ok(None)
+        }
+    }
 }

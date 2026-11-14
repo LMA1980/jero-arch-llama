@@ -8,16 +8,18 @@ use jero_core::{K3Error, QuantType, TensorView};
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    bf16_to_f32_finite, dequantize_q4_k_m_block, dequantize_q6_k_block, dequantize_q8_0_block,
-    f16_to_f32_finite,
+    bf16_to_f32_finite, dequantize_q4_k_m_block, dequantize_q5_k_block, dequantize_q6_k_block,
+    dequantize_q8_0_block, f16_to_f32_finite,
 };
 
 #[cfg(not(feature = "with-kernels"))]
 use crate::repack_cache::{
-    bf16_to_f32_finite, dequantize_q4_k_m_block, dequantize_q6_k_block, dequantize_q8_0_block,
-    f16_to_f32_finite,
+    bf16_to_f32_finite, dequantize_q4_k_m_block, dequantize_q5_k_block, dequantize_q6_k_block,
+    dequantize_q8_0_block, f16_to_f32_finite,
 };
-use crate::repack_cache::{dequantize_q4_0_block, get_or_repack, sanitize_f32_weight};
+use crate::repack_cache::{
+    dequantize_q4_0_block, dequantize_q5_0_block, get_or_repack, sanitize_f32_weight,
+};
 
 /// Hardware execution cluster lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,12 +78,36 @@ impl Default for PhaseLayout {
     }
 }
 
+fn block_dequant_dot<const N: usize, const B: usize>(
+    row: usize,
+    cols: usize,
+    raw_bytes: &[u8],
+    hidden: &[f32],
+    dequant: fn(&[u8; B], &mut [f32; N]),
+) -> f32 {
+    let blocks_per_row = cols / N;
+    let bytes_per_row = blocks_per_row * B;
+    let row_offset = row * bytes_per_row;
+    let mut sum = 0.0_f32;
+    let mut dequant_buf = [0.0_f32; N];
+    for b in 0..blocks_per_row {
+        let blk_off = row_offset + b * B;
+        if let Some(slice) = raw_bytes.get(blk_off..blk_off + B)
+            && let Ok(block) = <&[u8; B]>::try_from(slice)
+        {
+            dequant(block, &mut dequant_buf);
+            let h_start = b * N;
+            let h_chunk = &hidden[h_start..(h_start + N).min(hidden.len())];
+            for (k, &h) in h_chunk.iter().enumerate() {
+                sum += dequant_buf[k] * h;
+            }
+        }
+    }
+    sum
+}
+
 /// Computes the exact dequantized `f32` dot product of row `row` (`cols` elements) with `hidden`.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "exact reference dequantization across F32, F16, BF16, Q8_0, Q6_K, Q4_0, and Q4_K_M"
-)]
 pub fn compute_row_dot(
     row: usize,
     cols: usize,
@@ -103,7 +129,7 @@ pub fn compute_row_dot(
             }
             sum
         }
-        QuantType::F16 => {
+        QuantType::F16 | QuantType::BF16 => {
             let row_offset = row * cols * 2;
             let mut sum = 0.0_f32;
             for (i, &h) in hidden.iter().enumerate().take(cols) {
@@ -111,109 +137,44 @@ pub fn compute_row_dot(
                 if off + 2 <= raw_bytes.len() {
                     let b = &raw_bytes[off..off + 2];
                     let bits = u16::from_le_bytes([b[0], b[1]]);
-                    sum += f16_to_f32_finite(bits) * h;
-                }
-            }
-            sum
-        }
-        QuantType::BF16 => {
-            let row_offset = row * cols * 2;
-            let mut sum = 0.0_f32;
-            for (i, &h) in hidden.iter().enumerate().take(cols) {
-                let off = row_offset + i * 2;
-                if off + 2 <= raw_bytes.len() {
-                    let b = &raw_bytes[off..off + 2];
-                    let bits = u16::from_le_bytes([b[0], b[1]]);
-                    sum += bf16_to_f32_finite(bits) * h;
+                    let val = if quant == QuantType::BF16 {
+                        bf16_to_f32_finite(bits)
+                    } else {
+                        f16_to_f32_finite(bits)
+                    };
+                    sum += val * h;
                 }
             }
             sum
         }
         QuantType::Q8_0 => {
-            let blocks_per_row = cols / 32;
-            let bytes_per_row = blocks_per_row * 34;
-            let row_offset = row * bytes_per_row;
-            let mut sum = 0.0_f32;
-            let mut dequant_buf = [0.0_f32; 32];
-            for b in 0..blocks_per_row {
-                let blk_off = row_offset + b * 34;
-                if let Some(slice) = raw_bytes.get(blk_off..blk_off + 34)
-                    && let Ok(block) = <&[u8; 34]>::try_from(slice)
-                {
-                    dequantize_q8_0_block(block, &mut dequant_buf);
-                    let h_start = b * 32;
-                    let h_chunk = &hidden[h_start..(h_start + 32).min(hidden.len())];
-                    for (k, &h) in h_chunk.iter().enumerate() {
-                        sum += dequant_buf[k] * h;
-                    }
-                }
-            }
-            sum
-        }
-        QuantType::Q6_K => {
-            let blocks_per_row = cols / 256;
-            let bytes_per_row = blocks_per_row * 210;
-            let row_offset = row * bytes_per_row;
-            let mut sum = 0.0_f32;
-            let mut dequant_buf = [0.0_f32; 256];
-            for b in 0..blocks_per_row {
-                let blk_off = row_offset + b * 210;
-                if let Some(slice) = raw_bytes.get(blk_off..blk_off + 210)
-                    && let Ok(block) = <&[u8; 210]>::try_from(slice)
-                {
-                    dequantize_q6_k_block(block, &mut dequant_buf);
-                    let h_start = b * 256;
-                    let h_chunk = &hidden[h_start..(h_start + 256).min(hidden.len())];
-                    for (k, &h) in h_chunk.iter().enumerate() {
-                        sum += dequant_buf[k] * h;
-                    }
-                }
-            }
-            sum
+            block_dequant_dot::<32, 34>(row, cols, raw_bytes, hidden, dequantize_q8_0_block)
         }
         QuantType::Q4_0 => {
-            let blocks_per_row = cols / 32;
-            let bytes_per_row = blocks_per_row * 18;
-            let row_offset = row * bytes_per_row;
-            let mut sum = 0.0_f32;
-            let mut dequant_buf = [0.0_f32; 32];
-            for b in 0..blocks_per_row {
-                let blk_off = row_offset + b * 18;
-                if let Some(slice) = raw_bytes.get(blk_off..blk_off + 18)
-                    && let Ok(block) = <&[u8; 18]>::try_from(slice)
-                {
-                    dequantize_q4_0_block(block, &mut dequant_buf);
-                    let h_start = b * 32;
-                    let h_chunk = &hidden[h_start..(h_start + 32).min(hidden.len())];
-                    for (k, &h) in h_chunk.iter().enumerate() {
-                        sum += dequant_buf[k] * h;
-                    }
-                }
-            }
-            sum
+            block_dequant_dot::<32, 18>(row, cols, raw_bytes, hidden, dequantize_q4_0_block)
+        }
+        QuantType::Q5_0 => {
+            block_dequant_dot::<32, 22>(row, cols, raw_bytes, hidden, dequantize_q5_0_block)
         }
         QuantType::Q4_K_M => {
-            let blocks_per_row = cols / 256;
-            let bytes_per_row = blocks_per_row * 144;
-            let row_offset = row * bytes_per_row;
-            let mut sum = 0.0_f32;
-            let mut dequant_buf = [0.0_f32; 256];
-            for b in 0..blocks_per_row {
-                let blk_off = row_offset + b * 144;
-                if let Some(slice) = raw_bytes.get(blk_off..blk_off + 144)
-                    && let Ok(block) = <&[u8; 144]>::try_from(slice)
-                {
-                    dequantize_q4_k_m_block(block, &mut dequant_buf);
-                    let h_start = b * 256;
-                    let h_chunk = &hidden[h_start..(h_start + 256).min(hidden.len())];
-                    for (k, &h) in h_chunk.iter().enumerate() {
-                        sum += dequant_buf[k] * h;
-                    }
-                }
-            }
-            sum
+            block_dequant_dot::<256, 144>(row, cols, raw_bytes, hidden, dequantize_q4_k_m_block)
         }
-        QuantType::TQ1_0 | QuantType::TQ2_0 | QuantType::Q5_K => 0.0,
+        QuantType::Q5_K => {
+            block_dequant_dot::<256, 176>(row, cols, raw_bytes, hidden, dequantize_q5_k_block)
+        }
+        QuantType::Q6_K => {
+            block_dequant_dot::<256, 210>(row, cols, raw_bytes, hidden, dequantize_q6_k_block)
+        }
+        QuantType::Q4_1
+        | QuantType::Q5_1
+        | QuantType::Q8_1
+        | QuantType::Q2_K
+        | QuantType::Q3_K
+        | QuantType::IQ4_NL
+        | QuantType::TQ1_0
+        | QuantType::TQ2_0
+        | QuantType::I2_S
+        | QuantType::MXFP4 => 0.0,
     }
 }
 
@@ -227,7 +188,8 @@ pub fn compute_row_dot(
 /// # Errors
 ///
 /// Returns [`K3Error::TensorBoundsError`] if `output_weight` is not 2D or dimensions do not match
-/// `logits.len()` and `hidden.len()`.
+/// `logits.len()` and `hidden.len()`, or [`K3Error::CapabilityMismatch`] if `output_weight` uses
+/// an unsupported quantization format.
 pub fn project_lm_head_row_split(
     logits: &mut [f32],
     hidden: &[f32],
@@ -266,12 +228,6 @@ pub fn project_lm_head_row_split(
             ),
         });
     };
-
-    let quant = output_weight.quant();
-    if matches!(quant, QuantType::TQ1_0 | QuantType::TQ2_0 | QuantType::Q5_K) {
-        logits.fill(0.0);
-        return Ok(());
-    }
 
     let cached = get_or_repack(output_weight, rows, cols)?;
     let parallel = !layout.matmul.is_empty();

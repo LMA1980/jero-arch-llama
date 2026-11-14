@@ -4,8 +4,8 @@
 //! and multi-threaded `rayon` row-parallel projections.
 
 use jero_arch_llama::{
-    CachedMatrix, LlamaRecipe, PhaseLayout, clear_repack_cache, compute_row_dot,
-    project_lm_head_row_split,
+    CachedMatrix, LlamaRecipe, PhaseLayout, RopeScalingConfig, RopeType, clear_repack_cache,
+    compute_row_dot, project_lm_head_row_split,
 };
 use jero_core::test_helpers::create_synthetic_gguf_v3_with_kvs;
 use jero_core::{
@@ -112,6 +112,27 @@ fn build_realistic_matrix_bytes(
             }
             out
         }
+        QuantType::Q5_0 => {
+            let blocks = rows * (cols / 32);
+            let mut out = vec![0_u8; blocks * 22];
+            let d = f32_to_f16_bits(0.0625).to_le_bytes();
+            for b in 0..blocks {
+                let off = b * 22;
+                out[off..off + 2].copy_from_slice(&d);
+                #[expect(clippy::cast_possible_truncation, reason = "32-bit qh pattern")]
+                let qh = ((b.wrapping_mul(0x9E37_79B9) ^ seed) as u32).to_le_bytes();
+                out[off + 2..off + 6].copy_from_slice(&qh);
+                for k in 0..16 {
+                    #[expect(clippy::cast_possible_truncation, reason = "4-bit nibble pair")]
+                    {
+                        let lo = ((b * 7 + k * 3 + seed) & 0x0F) as u8;
+                        let hi = ((b * 11 + k * 5 + seed) & 0x0F) as u8;
+                        out[off + 6 + k] = lo | (hi << 4);
+                    }
+                }
+            }
+            out
+        }
         QuantType::Q4_K_M => {
             let blocks = rows * (cols / 256);
             let mut out = vec![0_u8; blocks * 144];
@@ -133,6 +154,38 @@ fn build_realistic_matrix_bytes(
                         let lo = ((b * 5 + q * 3 + seed) & 0x0F) as u8;
                         let hi = ((b * 13 + q * 7 + seed) & 0x0F) as u8;
                         out[off + 16 + q] = lo | (hi << 4);
+                    }
+                }
+            }
+            out
+        }
+        QuantType::Q5_K => {
+            let blocks = rows * (cols / 256);
+            let mut out = vec![0_u8; blocks * 176];
+            let d = f32_to_f16_bits(0.04).to_le_bytes();
+            let dmin = f32_to_f16_bits(0.015).to_le_bytes();
+            for b in 0..blocks {
+                let off = b * 176;
+                out[off..off + 2].copy_from_slice(&d);
+                out[off + 2..off + 4].copy_from_slice(&dmin);
+                for s in 0..12 {
+                    #[expect(clippy::cast_possible_truncation, reason = "packed 6-bit scale table")]
+                    {
+                        out[off + 4 + s] = (((b + s * 9 + seed) % 61) + 1) as u8;
+                    }
+                }
+                for h in 0..32 {
+                    #[expect(clippy::cast_possible_truncation, reason = "qh high-bit mask byte")]
+                    {
+                        out[off + 16 + h] = ((b * 17 + h * 13 + seed) & 0xFF) as u8;
+                    }
+                }
+                for q in 0..128 {
+                    #[expect(clippy::cast_possible_truncation, reason = "4-bit nibble pair")]
+                    {
+                        let lo = ((b * 5 + q * 3 + seed) & 0x0F) as u8;
+                        let hi = ((b * 13 + q * 7 + seed) & 0x0F) as u8;
+                        out[off + 48 + q] = lo | (hi << 4);
                     }
                 }
             }
@@ -335,7 +388,9 @@ fn test_repacked_gemv_and_batched_gemm_numerical_parity_all_quants() {
         QuantType::BF16,
         QuantType::Q8_0,
         QuantType::Q4_0,
+        QuantType::Q5_0,
         QuantType::Q4_K_M,
+        QuantType::Q5_K,
         QuantType::Q6_K,
     ];
 
@@ -579,7 +634,9 @@ fn test_batched_prefill_vs_sequential_decode_across_all_quants() {
         QuantType::F16,
         QuantType::Q8_0,
         QuantType::Q4_0,
+        QuantType::Q5_0,
         QuantType::Q4_K_M,
+        QuantType::Q5_K,
         QuantType::Q6_K,
     ];
 
@@ -702,4 +759,185 @@ fn test_rayon_worker_pool_row_parallel_equivalence() {
         out
     });
     assert_eq!(out_1, out_4);
+}
+
+#[test]
+fn test_deepseek_qwen_1536x151936_lm_head_and_metadata_hydration() {
+    clear_repack_cache();
+    // Hydrate DeepSeek-R1-Distill-Qwen-1.5B metadata: hidden=1536, vocab=151936 (zero 4096 fallback)
+    let hidden_dim = 1536_usize;
+    let vocab_rows = 151_936_usize;
+    let kvs = [
+        ("qwen2.block_count", GgufValue::Uint32(28)),
+        ("qwen2.embedding_length", GgufValue::Uint32(1536)),
+        ("qwen2.feed_forward_length", GgufValue::Uint32(8960)),
+        ("qwen2.attention.head_count", GgufValue::Uint32(12)),
+        ("qwen2.attention.head_count_kv", GgufValue::Uint32(2)),
+        ("qwen2.attention.key_length", GgufValue::Uint32(128)),
+        ("qwen2.vocab_size", GgufValue::Uint32(151_936)),
+        (
+            "qwen2.attention.layer_norm_rms_epsilon",
+            GgufValue::Float32(1e-6),
+        ),
+        ("qwen2.rope.freq_base", GgufValue::Float32(10_000.0)),
+    ];
+    let raw_meta = create_synthetic_gguf_v3_with_kvs("qwen2", 32, &kvs, &[]);
+    let gguf_meta = GgufFile::parse(&raw_meta).expect("parse metadata");
+    let hydrated = LlamaRecipe::from_metadata(gguf_meta.metadata());
+    assert_eq!(hydrated.hidden_dim, hidden_dim);
+    assert_eq!(hydrated.num_layers, 28);
+    assert_eq!(hydrated.ffn_dim, 8960);
+    assert_eq!(hydrated.n_heads_q, 12);
+    assert_eq!(hydrated.n_heads_kv, 2);
+    assert_eq!(hydrated.head_dim, 128);
+    assert_eq!(hydrated.vocab_size, vocab_rows);
+    assert_eq!(hydrated.rope_type, RopeType::NeoX);
+
+    // Exact [1536, 151936] untied Q4_0 output.weight projection via project_lm_head_row_split
+    let blocks_per_row = hidden_dim / 32;
+    let row_bytes = blocks_per_row * 18;
+    let mut lm_raw = vec![0_u8; vocab_rows * row_bytes];
+    let scale_f16 = f32_to_f16_bits(0.125).to_le_bytes();
+    for row in [0_usize, 75_968, vocab_rows - 1] {
+        let off = row * row_bytes;
+        for b in 0..blocks_per_row {
+            let blk = &mut lm_raw[off + b * 18..off + (b + 1) * 18];
+            blk[0..2].copy_from_slice(&scale_f16);
+            for k in 0..16 {
+                blk[2 + k] = u8::try_from((row + b + k) & 0x0F).unwrap()
+                    | (u8::try_from((row + 2 * k + 3) & 0x0F).unwrap() << 4);
+            }
+        }
+    }
+    let lm_shape = [hidden_dim, vocab_rows];
+    let lm_view = TensorView::from_bytes("output.weight", QuantType::Q4_0, &lm_shape, 0, &lm_raw)
+        .expect("lm view [1536, 151936]");
+    #[expect(clippy::cast_precision_loss, reason = "small bounded hidden index")]
+    let hidden_vec: Vec<f32> = (0..hidden_dim)
+        .map(|i| (((i * 7 + 3) % 29) as f32 - 14.0) * 0.05)
+        .collect();
+    let mut logits = vec![0.0_f32; vocab_rows];
+    project_lm_head_row_split(
+        &mut logits,
+        &hidden_vec,
+        &lm_view,
+        &PhaseLayout::row_split(0.5),
+    )
+    .expect("[1536, 151936] LM head projection must succeed without 4096 assumption");
+
+    let l2_norm = vector_l2(&hidden_vec);
+    #[expect(clippy::cast_precision_loss, reason = "hidden_dim fits in f32")]
+    let scale_bound = (l2_norm * (hidden_dim as f32).sqrt()).max(1.0);
+    for row in [0_usize, 75_968, vocab_rows - 1] {
+        let expected = compute_row_dot(row, hidden_dim, QuantType::Q4_0, &lm_raw, &hidden_vec);
+        let rel = (logits[row] - expected).abs() / scale_bound.max(expected.abs());
+        assert!(
+            rel < 1.0e-2,
+            "vocab row {row} parity failed: got {} vs {expected} (rel={rel})",
+            logits[row]
+        );
+    }
+    clear_repack_cache();
+}
+
+#[test]
+fn test_llama3_smooth_rope_and_norm_vs_neox_e2e() {
+    clear_repack_cache();
+    let kvs: Vec<(&str, GgufValue<'_>)> = vec![
+        ("llama.block_count", GgufValue::Uint32(1)),
+        ("llama.embedding_length", GgufValue::Uint32(64)),
+        ("llama.feed_forward_length", GgufValue::Uint32(96)),
+        ("llama.attention.head_count", GgufValue::Uint32(2)),
+        ("llama.attention.head_count_kv", GgufValue::Uint32(1)),
+        ("llama.attention.key_length", GgufValue::Uint32(32)),
+        ("llama.rope.freq_base", GgufValue::Float32(500_000.0)),
+        (
+            "llama.attention.layer_norm_rms_epsilon",
+            GgufValue::Float32(1e-5),
+        ),
+        ("llama.context_length", GgufValue::Uint32(16_384)),
+        ("llama.rope.dimension_count", GgufValue::Uint32(16)),
+        ("llama.rope.scaling.type", GgufValue::String("llama3")),
+        ("llama.rope.scaling.factor", GgufValue::Float32(8.0)),
+        (
+            "llama.rope.scaling.low_freq_factor",
+            GgufValue::Float32(1.0),
+        ),
+        (
+            "llama.rope.scaling.high_freq_factor",
+            GgufValue::Float32(4.0),
+        ),
+        (
+            "llama.rope.scaling.original_context_length",
+            GgufValue::Uint32(8192),
+        ),
+    ];
+
+    let norm_shape = [64_usize];
+    let emb_shape = [64_usize, 19_usize];
+    let q_shape = [64_usize, 64_usize];
+    let kv_shape = [64_usize, 32_usize];
+    let gate_shape = [64_usize, 96_usize];
+    let down_shape = [96_usize, 64_usize];
+    let specs: [(&str, QuantType, &[usize]); 12] = [
+        ("token_embd.weight", QuantType::Q8_0, &emb_shape),
+        ("blk.0.attn_norm.weight", QuantType::F32, &norm_shape),
+        ("blk.0.attn_q.weight", QuantType::Q5_0, &q_shape),
+        ("blk.0.attn_k.weight", QuantType::Q5_0, &kv_shape),
+        ("blk.0.attn_v.weight", QuantType::Q5_0, &kv_shape),
+        ("blk.0.attn_output.weight", QuantType::Q8_0, &q_shape),
+        ("blk.0.ffn_norm.weight", QuantType::F32, &norm_shape),
+        ("blk.0.ffn_gate.weight", QuantType::Q4_0, &gate_shape),
+        ("blk.0.ffn_up.weight", QuantType::Q4_0, &gate_shape),
+        ("blk.0.ffn_down.weight", QuantType::Q4_0, &down_shape),
+        ("output_norm.weight", QuantType::F32, &norm_shape),
+        ("output.weight", QuantType::Q8_0, &emb_shape),
+    ];
+
+    let raw_llama = create_synthetic_gguf_v3_with_kvs("llama", 32, &kvs, &specs);
+    let gguf_llama = GgufFile::parse(&raw_llama).expect("parse llama3 gguf");
+    let recipe_llama = LlamaRecipe::from_gguf(&gguf_llama).expect("hydrate llama3");
+    assert_eq!(recipe_llama.rope_type, RopeType::Norm);
+    assert_eq!(recipe_llama.rotary_dim, Some(16));
+    assert!(matches!(
+        recipe_llama.rope_scaling,
+        Some(RopeScalingConfig::Llama3Smooth {
+            factor,
+            original_max_position_embeddings: 8192,
+            ..
+        }) if (factor - 8.0).abs() < 1e-6
+    ));
+    recipe_llama
+        .validate_model(gguf_llama.metadata(), &gguf_llama)
+        .expect("validate_model accepts Q5_0 + Q8_0 + Q4_0 + Llama3Smooth");
+
+    let n_ctx = 8_usize;
+    let mut logits_a = vec![0.0_f32; 19];
+    let mut kv_a = vec![0.0_f32; n_ctx * 2 * 32];
+    let mut ctx_a =
+        ExecutionContext::new(&[1, 4, 7, 11], n_ctx, &mut logits_a, &mut kv_a).expect("ctx a");
+    recipe_llama
+        .prefill_step(&mut ctx_a, &gguf_llama)
+        .expect("batched prefill");
+
+    let mut logits_b = vec![0.0_f32; 19];
+    let mut kv_b = vec![0.0_f32; n_ctx * 2 * 32];
+    let mut ctx_b = ExecutionContext::new(&[1], n_ctx, &mut logits_b, &mut kv_b).expect("ctx b");
+    recipe_llama
+        .prefill_step(&mut ctx_b, &gguf_llama)
+        .expect("seq prefill 0");
+    for tok in [4_u32, 7, 11] {
+        ctx_b.prepare_decode(tok).expect("stage decode");
+        recipe_llama
+            .decode_step(&mut ctx_b, &gguf_llama)
+            .expect("decode step");
+    }
+
+    for (a, b) in logits_a.iter().zip(&logits_b) {
+        let diff = (a - b).abs();
+        assert!(
+            diff < 1e-4,
+            "Llama3Smooth batched vs sequential mismatch: {a} vs {b}"
+        );
+    }
 }
