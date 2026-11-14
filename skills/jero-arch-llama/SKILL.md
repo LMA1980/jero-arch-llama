@@ -15,3 +15,10 @@ Meta `Llama` (`llama`, `llama4` iRoPE) and `Qwen2` (`qwen2`) forward/decode arch
   - Pre-decodes 1D `RMSNorm` tensors (`attn_norm.weight`, `ffn_norm.weight`, `output_norm.weight`) and optional `qwen2` biases (`attn_{q,k,v,output}.bias`) into `128-byte`-aligned `Aligned128F32` vectors once at cache build time, eliminating per-step `decode_1d_f32` `Vec<f32>` allocations across `prefill_step_with_cache` and `decode_step_with_cache` (as well as repeated trait `prefill_step`/`decode_step` calls via `get_or_decode_1d_f32`).
 - **Compact Large-Vocab LM Head Streaming**:
   - Oversized `F16`/`BF16` (`> MAX_DENSE_HALF_ELEMENTS`) and `F32` (`> MAX_DENSE_F32_ELEMENTS`) LM heads (`128,256` Llama-3, `151,936` Qwen2.5) use `LmHeadCache::StreamingUntied`/`StreamingTied` and `project_lm_head_row_split` zero-copy row streaming within `RLIMIT_MEMLOCK` bounds.
+
+## Wave 3 Prefill Throughput APIs
+
+- **Zero-Allocation Direct Column Scatter GEMM**:
+  - `CachedMatrix::project_batch_with_act` / `run_repacked_gemm_panels` executes `RepackedWeight::gemm_rows` (`A100` `smt.vmadot` for `M >= 8`, RVV vector, or portable fallback) and scatters `[M, sub_n]` tiles directly into disjoint columns of `[M, out_dim]` activation workspaces without per-panel `panel_major` heap allocations, using caller-reused `QuantizedBatchAct::quantize_into` scratch across transformer layers.
+- **Batched Causal GQA & Chunked `start_position` Prefill**:
+  - `LlamaRecipe::prefill_step` / `prefill_step_with_cache` honors `ExecutionContext::start_position()` and `ExecutionContext::compute_logits()`, rotating RoPE at `start_pos + tok`, appending contiguous `[start_pos..end_pos]` K/V planes via `KvCacheView::layer_kv_mut`, dispatching `gqa_causal_attention_prefill_f32` (`AttentionMaskConfig`) with preallocated `scores_scratch` (plus `--no-default-features` parity), and skipping final RMSNorm + LM-head `project_logits` on intermediate prefill chunks where `compute_logits() == false`.

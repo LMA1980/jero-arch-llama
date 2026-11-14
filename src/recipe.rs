@@ -13,8 +13,8 @@ use jero_core::{
 
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
-    BaselineKernel, VectorKernel, apply_rope_with_inv_freq_and_layout, gqa_causal_attention_f32,
-    precompute_rope_inv_freq, swiglu_f32,
+    AttentionMaskConfig, BaselineKernel, VectorKernel, apply_rope_with_inv_freq_and_layout,
+    gqa_causal_attention_prefill_f32, precompute_rope_inv_freq, swiglu_f32,
 };
 #[cfg(feature = "with-kernels")]
 pub use jero_kernels_rvv::{RopeScalingConfig, RopeType};
@@ -59,6 +59,30 @@ pub enum RopeScalingConfig {
         /// Context length threshold separating short and long factor tables.
         original_max_position_embeddings: usize,
     },
+}
+
+#[cfg(not(feature = "with-kernels"))]
+#[derive(Clone, Copy)]
+struct AttentionMaskConfig {
+    start_pos: usize,
+    sliding_window: Option<usize>,
+    scale: f32,
+}
+
+#[cfg(not(feature = "with-kernels"))]
+impl AttentionMaskConfig {
+    const fn causal(start_pos: usize, scale: f32) -> Self {
+        Self {
+            start_pos,
+            sliding_window: None,
+            scale,
+        }
+    }
+
+    const fn with_sliding_window(mut self, sliding_window: Option<usize>) -> Self {
+        self.sliding_window = sliding_window;
+        self
+    }
 }
 
 use crate::dispatch::{PhaseLayout, project_lm_head_row_split};
@@ -507,9 +531,9 @@ impl LlamaRecipe {
         weights: &dyn ModelWeights,
         cache: Option<&ModelRepackCache>,
     ) -> Result<(), K3Error> {
-        let prompt_tokens = ctx.prompt_tokens().to_vec();
+        let prompt_tokens = ctx.prompt_tokens();
         let prompt_len = prompt_tokens.len();
-        let start_pos = ctx.position();
+        let start_pos = ctx.start_position();
         let end_pos = start_pos
             .checked_add(prompt_len)
             .ok_or(K3Error::ContextLengthExceeded {
@@ -523,19 +547,28 @@ impl LlamaRecipe {
             });
         }
 
-        let logits_len = ctx.logits().len();
+        let compute_logits = ctx.compute_logits();
+        let logits_len = if compute_logits {
+            ctx.logits().len()
+        } else {
+            0
+        };
         let kv_geometry = ctx.kv_geometry();
         let last_hidden = self.execute_batch_forward(
-            &prompt_tokens,
+            prompt_tokens,
             start_pos,
             ctx.kv_cache_mut(),
             kv_geometry,
             weights,
             logits_len,
+            compute_logits,
             cache,
         )?;
         ctx.advance_position(prompt_len)?;
-        Self::project_logits(ctx, &last_hidden, weights, None, cache)
+        if compute_logits {
+            Self::project_logits(ctx, &last_hidden, weights, None, cache)?;
+        }
+        Ok(())
     }
 
     fn decode_step_inner(
@@ -569,6 +602,7 @@ impl LlamaRecipe {
             kv_geometry,
             weights,
             logits_len,
+            true,
             cache,
         )?;
         ctx.advance_position(1)?;
@@ -910,6 +944,7 @@ impl LlamaRecipe {
         kv_geometry: Option<KvGeometry>,
         weights: &dyn ModelWeights,
         logits_len: usize,
+        compute_logits: bool,
         cache: Option<&ModelRepackCache>,
     ) -> Result<Vec<f32>, K3Error> {
         let m = tokens.len();
@@ -942,7 +977,11 @@ impl LlamaRecipe {
             });
         }
         if m == 0 {
-            return Ok(vec![0.0_f32; geom.hidden_dim]);
+            return Ok(if compute_logits {
+                vec![0.0_f32; geom.hidden_dim]
+            } else {
+                Vec::new()
+            });
         }
 
         let synthetic_mode = weights.tensor_count() == 0;
@@ -972,6 +1011,10 @@ impl LlamaRecipe {
         let mut gate_batch = vec![0.0_f32; m * geom.ffn_dim];
         let mut up_batch = vec![0.0_f32; m * geom.ffn_dim];
         let mut ffn_act_batch = vec![0.0_f32; m * geom.ffn_dim];
+        let mut scores_scratch = vec![0.0_f32; end_pos];
+        let mut shared_hidden_act = QuantizedBatchAct::new();
+        let mut shared_q_act = QuantizedBatchAct::new();
+        let mut shared_ffn_act = QuantizedBatchAct::new();
 
         #[expect(
             clippy::cast_precision_loss,
@@ -993,7 +1036,7 @@ impl LlamaRecipe {
                 weights,
             )?;
 
-            // 2. Batched Q, K, V projections sharing pre-quantized activation tiles when possible
+            // 2. Batched Q, K, V projections sharing reusable pre-quantized activation scratch
             project_qkv_layer(
                 layer,
                 &norm_batch,
@@ -1004,6 +1047,7 @@ impl LlamaRecipe {
                 m,
                 weights,
                 layer_cache,
+                &mut shared_hidden_act,
             )?;
 
             // 3. Rotary Position Embeddings on BOTH Q and K
@@ -1029,7 +1073,7 @@ impl LlamaRecipe {
                 }
             }
 
-            // 4. Zero-copy 0..=pos KV Cache Residency & Causal GQA Attention
+            // 4. Batched KV Cache Append (`[start_pos..end_pos]`) & Causal GQA Attention
             execute_layer_causal_gqa(
                 layer,
                 start_pos,
@@ -1043,12 +1087,24 @@ impl LlamaRecipe {
                 kv_geometry,
                 synthetic_mode,
                 &mut attn_out_batch,
+                &mut scores_scratch,
             )?;
 
             // 5. Batched Attention Output Projection & Residual Connection
             if let Some(lc) = layer_cache {
-                lc.wo
-                    .project_batch(&mut proj_hidden_batch, &attn_out_batch, m, true)?;
+                let wo_act = if lc.wo.uses_repacked_storage() {
+                    shared_q_act.quantize_into(&attn_out_batch, m, geom.total_q)?;
+                    Some(&shared_q_act)
+                } else {
+                    None
+                };
+                lc.wo.project_batch_with_act(
+                    &mut proj_hidden_batch,
+                    &attn_out_batch,
+                    wo_act,
+                    m,
+                    true,
+                )?;
                 add_optional_bias(
                     &mut proj_hidden_batch,
                     &format!("blk.{layer}.attn_output.bias"),
@@ -1079,7 +1135,19 @@ impl LlamaRecipe {
                         });
                     }
                     let cached = get_or_repack(&out_tensor, rows, cols)?;
-                    cached.project_batch(&mut proj_hidden_batch, &attn_out_batch, m, true)?;
+                    let wo_act = if cached.uses_repacked_storage() {
+                        shared_q_act.quantize_into(&attn_out_batch, m, geom.total_q)?;
+                        Some(&shared_q_act)
+                    } else {
+                        None
+                    };
+                    cached.project_batch_with_act(
+                        &mut proj_hidden_batch,
+                        &attn_out_batch,
+                        wo_act,
+                        m,
+                        true,
+                    )?;
                     add_optional_bias(
                         &mut proj_hidden_batch,
                         &format!("blk.{layer}.attn_output.bias"),
@@ -1130,7 +1198,13 @@ impl LlamaRecipe {
                 m,
                 weights,
                 layer_cache,
+                &mut shared_hidden_act,
+                &mut shared_ffn_act,
             )?;
+        }
+
+        if !compute_logits {
+            return Ok(Vec::new());
         }
 
         // Final output RMSNorm is only required for the last token row (m - 1)
@@ -1370,7 +1444,7 @@ fn load_optional_proj_matrix(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "projects Q, K, and V batches with shared pre-quantized activation buffer"
+    reason = "projects Q, K, and V batches with reusable pre-quantized activation scratch"
 )]
 fn project_qkv_layer(
     layer: usize,
@@ -1382,6 +1456,7 @@ fn project_qkv_layer(
     m: usize,
     weights: &dyn ModelWeights,
     layer_cache: Option<&LayerRepackCache>,
+    shared_act_buf: &mut QuantizedBatchAct,
 ) -> Result<(), K3Error> {
     let (q_mat, k_mat, v_mat) = if let Some(lc) = layer_cache {
         (
@@ -1415,18 +1490,24 @@ fn project_qkv_layer(
         )
     };
 
-    let shared_act = if q_mat.is_some() || k_mat.is_some() || v_mat.is_some() {
-        Some(QuantizedBatchAct::try_quantize(
-            norm_batch,
-            m,
-            geom.hidden_dim,
-        )?)
+    let needs_repacked_act = q_mat
+        .as_ref()
+        .is_some_and(|mat| mat.uses_repacked_storage())
+        || k_mat
+            .as_ref()
+            .is_some_and(|mat| mat.uses_repacked_storage())
+        || v_mat
+            .as_ref()
+            .is_some_and(|mat| mat.uses_repacked_storage());
+    let shared_act = if needs_repacked_act {
+        shared_act_buf.quantize_into(norm_batch, m, geom.hidden_dim)?;
+        Some(&*shared_act_buf)
     } else {
         None
     };
 
     if let Some(mat) = q_mat {
-        mat.project_batch_with_act(q_batch, norm_batch, shared_act.as_ref(), m, true)?;
+        mat.project_batch_with_act(q_batch, norm_batch, shared_act, m, true)?;
     } else {
         fill_synthetic_proj(q_batch, norm_batch, geom.total_q, geom.hidden_dim, m, 1.0);
     }
@@ -1441,7 +1522,7 @@ fn project_qkv_layer(
     )?;
 
     if let Some(mat) = k_mat {
-        mat.project_batch_with_act(k_batch, norm_batch, shared_act.as_ref(), m, true)?;
+        mat.project_batch_with_act(k_batch, norm_batch, shared_act, m, true)?;
     } else {
         fill_synthetic_proj(k_batch, norm_batch, geom.total_kv, geom.hidden_dim, m, 1.0);
     }
@@ -1456,7 +1537,7 @@ fn project_qkv_layer(
     )?;
 
     if let Some(mat) = v_mat {
-        mat.project_batch_with_act(v_batch, norm_batch, shared_act.as_ref(), m, true)?;
+        mat.project_batch_with_act(v_batch, norm_batch, shared_act, m, true)?;
     } else {
         fill_synthetic_proj(v_batch, norm_batch, geom.total_kv, geom.hidden_dim, m, 1.0);
     }
@@ -1533,7 +1614,7 @@ fn resolve_kv_geometry(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "manages layer KV cache slice partitioning and batched causal GQA execution"
+    reason = "manages layer KV cache append and batched causal GQA execution with caller scratch"
 )]
 fn execute_layer_causal_gqa(
     layer: usize,
@@ -1548,6 +1629,7 @@ fn execute_layer_causal_gqa(
     kv_geometry: Option<KvGeometry>,
     synthetic_mode: bool,
     attn_out_batch: &mut [f32],
+    scores_scratch: &mut [f32],
 ) -> Result<(), K3Error> {
     let end_pos = start_pos + m;
     let resolved_geom = resolve_kv_geometry(
@@ -1561,57 +1643,38 @@ fn execute_layer_causal_gqa(
 
     if let Some(view_geom) = resolved_geom {
         let mut kv_view = KvCacheView::new(kv_cache, view_geom)?;
-        for tok in 0..m {
-            let (k_slot, v_slot) = kv_view.write_pos_range(layer, start_pos + tok)?;
-            k_slot.copy_from_slice(&k_batch[tok * geom.total_kv..(tok + 1) * geom.total_kv]);
-            v_slot.copy_from_slice(&v_batch[tok * geom.total_kv..(tok + 1) * geom.total_kv]);
+        if end_pos > view_geom.seq_capacity {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: end_pos,
+                max_context_tokens: view_geom.seq_capacity,
+            });
+        }
+        let dst_start = start_pos * geom.total_kv;
+        let dst_end = end_pos * geom.total_kv;
+        let batch_kv_elems = m * geom.total_kv;
+        {
+            let (k_plane, v_plane) = kv_view.layer_kv_mut(layer)?;
+            k_plane[dst_start..dst_end].copy_from_slice(&k_batch[..batch_kv_elems]);
+            v_plane[dst_start..dst_end].copy_from_slice(&v_batch[..batch_kv_elems]);
         }
 
-        let kv_view_ref = &kv_view;
-        #[cfg(not(miri))]
-        if m >= 2 && rayon::current_num_threads() > 1 {
-            use rayon::prelude::*;
-            return attn_out_batch
-                .par_chunks_mut(geom.total_q)
-                .enumerate()
-                .try_for_each(|(tok, out_tok)| {
-                    let cur_end = start_pos + tok + 1;
-                    let (k_valid, v_valid) = kv_view_ref.valid_kv_range(layer, cur_end)?;
-                    let cur_seq_len = k_valid.len() / geom.total_kv;
-                    let q_tok = &q_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
-                    gqa_attention_compat(
-                        out_tok,
-                        q_tok,
-                        k_valid,
-                        v_valid,
-                        geom.n_heads_q,
-                        geom.n_heads_kv,
-                        geom.head_d_even,
-                        cur_seq_len,
-                        attn_scale,
-                    )
-                });
-        }
-
-        for tok in 0..m {
-            let cur_end = start_pos + tok + 1;
-            let (k_valid, v_valid) = kv_view_ref.valid_kv_range(layer, cur_end)?;
-            let cur_seq_len = k_valid.len() / geom.total_kv;
-            let q_tok = &q_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
-            let out_tok = &mut attn_out_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
-            gqa_attention_compat(
-                out_tok,
-                q_tok,
-                k_valid,
-                v_valid,
-                geom.n_heads_q,
-                geom.n_heads_kv,
-                geom.head_d_even,
-                cur_seq_len,
-                attn_scale,
-            )?;
-        }
-        return Ok(());
+        let (k_plane, v_plane) = kv_view.layer_kv(layer)?;
+        let active_kv_elems = end_pos * geom.total_kv;
+        let mask_cfg = AttentionMaskConfig::causal(start_pos, attn_scale)
+            .with_sliding_window(view_geom.sliding_window);
+        return gqa_attention_prefill_compat(
+            attn_out_batch,
+            q_batch,
+            &k_plane[..active_kv_elems],
+            &v_plane[..active_kv_elems],
+            m,
+            geom.n_heads_q,
+            geom.n_heads_kv,
+            geom.head_d_even,
+            end_pos,
+            mask_cfg,
+            scores_scratch,
+        );
     }
 
     // Fallback when a synthetic unit test supplies a tiny scratch `kv_cache`
@@ -1633,23 +1696,19 @@ fn execute_layer_causal_gqa(
         }
     }
 
-    for tok in 0..m {
-        let cur_len = tok + 1;
-        let q_tok = &q_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
-        let out_tok = &mut attn_out_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
-        gqa_attention_compat(
-            out_tok,
-            q_tok,
-            &k_batch[..cur_len * geom.total_kv],
-            &v_batch[..cur_len * geom.total_kv],
-            geom.n_heads_q,
-            geom.n_heads_kv,
-            geom.head_d_even,
-            cur_len,
-            attn_scale,
-        )?;
-    }
-    Ok(())
+    gqa_attention_prefill_compat(
+        attn_out_batch,
+        q_batch,
+        k_batch,
+        v_batch,
+        m,
+        geom.n_heads_q,
+        geom.n_heads_kv,
+        geom.head_d_even,
+        m,
+        AttentionMaskConfig::causal(0, attn_scale),
+        scores_scratch,
+    )
 }
 
 #[expect(
@@ -1668,6 +1727,8 @@ fn execute_layer_swiglu_ffn(
     m: usize,
     weights: &dyn ModelWeights,
     layer_cache: Option<&LayerRepackCache>,
+    shared_hidden_act: &mut QuantizedBatchAct,
+    shared_ffn_act: &mut QuantizedBatchAct,
 ) -> Result<(), K3Error> {
     let (gate_mat, up_mat, down_mat) = if let Some(lc) = layer_cache {
         (
@@ -1701,18 +1762,21 @@ fn execute_layer_swiglu_ffn(
         )
     };
 
-    let shared_act = if gate_mat.is_some() || up_mat.is_some() {
-        Some(QuantizedBatchAct::try_quantize(
-            norm_batch,
-            m,
-            geom.hidden_dim,
-        )?)
+    let needs_hidden_act = gate_mat
+        .as_ref()
+        .is_some_and(|mat| mat.uses_repacked_storage())
+        || up_mat
+            .as_ref()
+            .is_some_and(|mat| mat.uses_repacked_storage());
+    let hidden_act = if needs_hidden_act {
+        shared_hidden_act.quantize_into(norm_batch, m, geom.hidden_dim)?;
+        Some(&*shared_hidden_act)
     } else {
         None
     };
 
     if let Some(mat) = gate_mat {
-        mat.project_batch_with_act(gate_batch, norm_batch, shared_act.as_ref(), m, true)?;
+        mat.project_batch_with_act(gate_batch, norm_batch, hidden_act, m, true)?;
     } else {
         fill_synthetic_proj(
             gate_batch,
@@ -1725,7 +1789,7 @@ fn execute_layer_swiglu_ffn(
     }
 
     if let Some(mat) = up_mat {
-        mat.project_batch_with_act(up_batch, norm_batch, shared_act.as_ref(), m, true)?;
+        mat.project_batch_with_act(up_batch, norm_batch, hidden_act, m, true)?;
     } else {
         fill_synthetic_proj(up_batch, norm_batch, geom.ffn_dim, geom.hidden_dim, m, 0.5);
     }
@@ -1733,7 +1797,13 @@ fn execute_layer_swiglu_ffn(
     swiglu_compat(ffn_act_batch, gate_batch, up_batch)?;
 
     if let Some(cached) = down_mat {
-        cached.project_batch(proj_hidden_batch, ffn_act_batch, m, true)?;
+        let down_act = if cached.uses_repacked_storage() {
+            shared_ffn_act.quantize_into(ffn_act_batch, m, geom.ffn_dim)?;
+            Some(&*shared_ffn_act)
+        } else {
+            None
+        };
+        cached.project_batch_with_act(proj_hidden_batch, ffn_act_batch, down_act, m, true)?;
         for (h, &p) in hidden_batch.iter_mut().zip(&*proj_hidden_batch) {
             *h += p;
         }
@@ -1984,73 +2054,190 @@ pub(crate) fn apply_rope_compat(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "matches gqa_causal_attention_f32 signature"
+    reason = "matches gqa_causal_attention_prefill_f32 signature"
 )]
-fn gqa_attention_compat(
+fn gqa_attention_prefill_compat(
     out: &mut [f32],
     q: &[f32],
     k_cache: &[f32],
     v_cache: &[f32],
+    m: usize,
     n_heads_q: usize,
     n_heads_kv: usize,
     head_dim: usize,
-    seq_len: usize,
-    scale: f32,
+    total_seq_len: usize,
+    config: AttentionMaskConfig,
+    scores_scratch: &mut [f32],
 ) -> Result<(), K3Error> {
     #[cfg(feature = "with-kernels")]
     {
-        gqa_causal_attention_f32(
-            out, q, k_cache, v_cache, n_heads_q, n_heads_kv, head_dim, seq_len, scale,
+        gqa_causal_attention_prefill_f32(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            m,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            total_seq_len,
+            config,
+            scores_scratch,
         )
     }
     #[cfg(not(feature = "with-kernels"))]
     {
-        if n_heads_kv == 0
-            || n_heads_q % n_heads_kv != 0
-            || seq_len == 0
-            || out.len() != n_heads_q * head_dim
-            || q.len() != n_heads_q * head_dim
-        {
-            return Err(K3Error::CapabilityMismatch {
-                architecture: "attention".to_owned(),
-                reason: "invalid GQA dimensions".to_owned(),
-            });
-        }
-        let group = n_heads_q / n_heads_kv;
-        let kv_stride = n_heads_kv * head_dim;
-        let mut scores = vec![0.0_f32; seq_len];
-        for hq in 0..n_heads_q {
-            let hkv = hq / group;
-            let q_head = &q[hq * head_dim..(hq + 1) * head_dim];
-            let mut max_score = f32::NEG_INFINITY;
-            for t in 0..seq_len {
-                let k_head =
-                    &k_cache[t * kv_stride + hkv * head_dim..t * kv_stride + (hkv + 1) * head_dim];
-                let s = q_head.iter().zip(k_head).map(|(&a, &b)| a * b).sum::<f32>() * scale;
-                scores[t] = s;
-                if s > max_score {
-                    max_score = s;
-                }
-            }
-            let mut denom = 0.0_f32;
-            for s in &mut scores {
-                *s = (*s - max_score).exp();
-                denom += *s;
-            }
-            let inv_denom = if denom > 0.0 { 1.0 / denom } else { 0.0 };
-            let out_head = &mut out[hq * head_dim..(hq + 1) * head_dim];
-            out_head.fill(0.0);
-            for (t, &w_unnorm) in scores.iter().enumerate() {
-                let w = w_unnorm * inv_denom;
-                let v_head =
-                    &v_cache[t * kv_stride + hkv * head_dim..t * kv_stride + (hkv + 1) * head_dim];
-                for (o, &v_val) in out_head.iter_mut().zip(v_head) {
-                    *o += w * v_val;
-                }
-            }
-        }
-        Ok(())
+        gqa_attention_prefill_portable(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            m,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            total_seq_len,
+            config,
+            scores_scratch,
+        )
     }
+}
+
+#[cfg(not(feature = "with-kernels"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "portable GQA prefill mirrors gqa_causal_attention_prefill_f32 signature"
+)]
+fn validate_gqa_prefill_portable(
+    out_len: usize,
+    q_len: usize,
+    k_len: usize,
+    v_len: usize,
+    scratch_len: usize,
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    config: AttentionMaskConfig,
+) -> Result<(), K3Error> {
+    let query_end = config.start_pos.saturating_add(m);
+    let min_scratch = config
+        .sliding_window
+        .map_or(query_end, |w| w.min(query_end));
+    let kv_stride = n_heads_kv.saturating_mul(head_dim);
+    let expected_q = m.saturating_mul(n_heads_q).saturating_mul(head_dim);
+    let min_kv = total_seq_len.saturating_mul(kv_stride);
+    if m == 0
+        || n_heads_kv == 0
+        || n_heads_q == 0
+        || head_dim == 0
+        || total_seq_len == 0
+        || n_heads_q % n_heads_kv != 0
+        || !config.scale.is_finite()
+        || config.sliding_window == Some(0)
+        || query_end > total_seq_len
+    {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "attention".to_owned(),
+            reason: "invalid GQA prefill dimensions or mask config".to_owned(),
+        });
+    }
+    if out_len != expected_q
+        || q_len != expected_q
+        || k_len < min_kv
+        || v_len < min_kv
+        || scratch_len < min_scratch
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_prefill".to_owned(),
+            offset: 0,
+            byte_len: out_len,
+            buffer_len: expected_q,
+            reason: "GQA prefill slice or scratch length mismatch".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "with-kernels"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "portable GQA prefill mirrors gqa_causal_attention_prefill_f32 signature"
+)]
+fn gqa_attention_prefill_portable(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    config: AttentionMaskConfig,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    validate_gqa_prefill_portable(
+        out.len(),
+        q.len(),
+        k_cache.len(),
+        v_cache.len(),
+        scores_scratch.len(),
+        m,
+        n_heads_q,
+        n_heads_kv,
+        head_dim,
+        total_seq_len,
+        config,
+    )?;
+
+    let kv_stride = n_heads_kv * head_dim;
+    let group = n_heads_q / n_heads_kv;
+    for hkv in 0..n_heads_kv {
+        let kv_head_off = hkv * head_dim;
+        for tok in 0..m {
+            let query_pos = config.start_pos + tok;
+            let valid_end = (query_pos + 1).min(total_seq_len);
+            let valid_start = config
+                .sliding_window
+                .map_or(0, |w| query_pos.saturating_add(1).saturating_sub(w));
+            let active_len = valid_end.saturating_sub(valid_start);
+            let score_buf = &mut scores_scratch[..active_len];
+
+            for g in 0..group {
+                let hq = hkv * group + g;
+                let q_head = &q[(tok * n_heads_q + hq) * head_dim..][..head_dim];
+                let mut max_score = f32::NEG_INFINITY;
+                for (slot, s) in score_buf.iter_mut().zip(valid_start..valid_end) {
+                    let k_head = &k_cache[s * kv_stride + kv_head_off..][..head_dim];
+                    let score =
+                        q_head.iter().zip(k_head).map(|(&a, &b)| a * b).sum::<f32>() * config.scale;
+                    *slot = score;
+                    if score > max_score {
+                        max_score = score;
+                    }
+                }
+
+                let mut denom = 0.0_f32;
+                for s in score_buf.iter_mut() {
+                    *s = (*s - max_score).exp();
+                    denom += *s;
+                }
+                let inv_denom = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+                let out_head = &mut out[(tok * n_heads_q + hq) * head_dim..][..head_dim];
+                out_head.fill(0.0);
+                for (s, &w_unnorm) in (valid_start..valid_end).zip(score_buf.iter()) {
+                    let w = w_unnorm * inv_denom;
+                    let v_head = &v_cache[s * kv_stride + kv_head_off..][..head_dim];
+                    for (o, &v_val) in out_head.iter_mut().zip(v_head) {
+                        *o += w * v_val;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn swiglu_compat(out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Error> {
