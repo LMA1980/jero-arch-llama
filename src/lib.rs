@@ -13,10 +13,13 @@ pub mod repack_cache;
 pub use dispatch::{Lane, PhaseLayout, compute_row_dot, project_lm_head_row_split};
 pub use recipe::{LlamaRecipe, RopeScalingConfig, RopeType};
 pub use repack_cache::{
-    Aligned128, CachedMatrix, PANEL_ROWS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES,
-    Q5_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, QuantizedBatchAct,
-    cached_matrix_count, clear_repack_cache, dequantize_q4_0_block, dequantize_q5_0_block,
-    dequantize_q5_k_block, get_or_repack, par_for_each_row_tile,
+    Aligned128, Aligned128F32, CachedMatrix, LayerRepackCache, LmHeadCache, MAX_DENSE_F32_ELEMENTS,
+    MAX_DENSE_HALF_ELEMENTS, ModelRepackCache, PANEL_ROWS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS,
+    Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS,
+    QuantizedBatchAct, cached_matrix_count, cached_vector_1d_count, clear_repack_cache,
+    decode_1d_f32, dequantize_q4_0_block, dequantize_q5_0_block, dequantize_q5_k_block,
+    get_or_decode_1d_f32, get_or_repack, is_oversized_dense, par_for_each_row_tile,
+    thread_decode_1d_count,
 };
 
 #[cfg(test)]

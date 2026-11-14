@@ -1,9 +1,17 @@
 ---
 name: jero-arch-llama
-description: "Implement and validate Meta Llama (Llama 3 and Llama 4 iRoPE) ArchRecipe execution, GQA KV routing, and SwiGLU FFN forward passes in jero-arch-llama."
+description: Llama (`llama`, `llama4` iRoPE) and Qwen2 (`qwen2`) architecture recipe crate (`jero-arch-llama`) with `ModelRepackCache` delegation to `jero-kernels-rvv::RepackedWeight`, `128-byte`-aligned 1D norm/bias caching, and compact large-vocabulary LM head streaming.
 ---
 
-# `jero-arch-llama` Architecture Recipe Invariants
+# `jero-arch-llama`
 
-- Implement `jero_core::ArchRecipe` with zero-copy `TensorView` weight lookup, Grouped-Query Attention (GQA), RoPE / Llama 4 interleaved iRoPE frequency scaling, and optional `jero-kernels-rvv` hardware acceleration.
-- Use `usize` for tensor slice indexing and memory offsets, and `u32` for GGUF architectural hyperparameters (`n_layer`, `n_head`, `n_head_kv`, `n_embd`).
+Meta `Llama` (`llama`, `llama4` iRoPE) and `Qwen2` (`qwen2`) forward/decode architecture recipe for `Jero-Mu`.
+
+## Key Architecture & Wave 2 APIs
+
+- **`LlamaRecipe::build_repack_cache(&self, weights)` -> `ModelRepackCache`**:
+  - Pre-repacks per-layer weights (`wq`, `wk`, `wv`, `wo`, `wgate`, `wup`, `wdown`) once via `CachedMatrix::repack`, delegating `256b` `X100` / `1024b` `A100` `8x16` tile packing and `QuantizedActQ8` quantization to `jero_kernels_rvv::repack::RepackedWeight` when `with-kernels` is enabled (with a parity portable scalar fallback under `--no-default-features`).
+  - Enforces fail-closed `K3Error::CapabilityMismatch` rejection for un-admitted formats (`Q2_K`, `Q3_K`, `Q4_1`, `Q5_1`, `Q8_1`, `IQ4_NL`, `TQ1_0`, `TQ2_0`, `I2_S`, `MXFP4`) while supporting `Q4_0`, `Q4_K_M`, `Q5_0`, `Q5_K`, `Q6_K`, `Q8_0`, `F16`, `BF16`, and `F32`.
+  - Pre-decodes 1D `RMSNorm` tensors (`attn_norm.weight`, `ffn_norm.weight`, `output_norm.weight`) and optional `qwen2` biases (`attn_{q,k,v,output}.bias`) into `128-byte`-aligned `Aligned128F32` vectors once at cache build time, eliminating per-step `decode_1d_f32` `Vec<f32>` allocations across `prefill_step_with_cache` and `decode_step_with_cache` (as well as repeated trait `prefill_step`/`decode_step` calls via `get_or_decode_1d_f32`).
+- **Compact Large-Vocab LM Head Streaming**:
+  - Oversized `F16`/`BF16` (`> MAX_DENSE_HALF_ELEMENTS`) and `F32` (`> MAX_DENSE_F32_ELEMENTS`) LM heads (`128,256` Llama-3, `151,936` Qwen2.5) use `LmHeadCache::StreamingUntied`/`StreamingTied` and `project_lm_head_row_split` zero-copy row streaming within `RLIMIT_MEMLOCK` bounds.

@@ -63,8 +63,9 @@ pub enum RopeScalingConfig {
 
 use crate::dispatch::{PhaseLayout, project_lm_head_row_split};
 use crate::repack_cache::{
-    QuantizedBatchAct, decode_1d_f32, decode_row_to_f32, get_or_repack, quant_block_geometry,
-    resolve_2d_dims, set_active_model_anchor,
+    Aligned128F32, LayerRepackCache, LmHeadCache, ModelRepackCache, QuantizedBatchAct,
+    decode_row_to_f32, get_or_decode_1d_f32, get_or_repack, quant_block_geometry, resolve_2d_dims,
+    set_active_model_anchor,
 };
 
 /// Llama and Qwen2 architecture recipe implementation.
@@ -433,6 +434,147 @@ impl LlamaRecipe {
             .unwrap_or(false)
     }
 
+    /// Pre-repacks layer projections and pre-decodes `128-byte`-aligned 1D `RMSNorm` / `qwen2`
+    /// bias vectors once into a model-scoped [`ModelRepackCache`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] when required
+    /// weights are missing, un-admitted, or shape-mismatched.
+    pub fn build_repack_cache(
+        &self,
+        weights: &dyn ModelWeights,
+    ) -> Result<ModelRepackCache, K3Error> {
+        if weights.tensor_count() == 0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: self.architecture_id().to_owned(),
+                reason: "build_repack_cache requires resident model tensors".to_owned(),
+            });
+        }
+        let geom = self.resolve_geometry(weights, 0)?;
+        let lm_name = if weights.contains_tensor("output.weight") {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        let lm_tensor = weights.tensor(lm_name)?;
+        let (vocab_size, _) = resolve_2d_dims(&lm_tensor, geom.hidden_dim)?;
+        ModelRepackCache::build(
+            self.architecture,
+            geom.num_layers,
+            geom.hidden_dim,
+            geom.ffn_dim,
+            geom.total_q,
+            geom.total_kv,
+            vocab_size,
+            weights,
+        )
+    }
+
+    /// Executes batched prefill using a caller-owned model-scoped [`ModelRepackCache`],
+    /// eliminating per-step `decode_1d_f32` allocations and global cache lookups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] on context overflow, cache geometry mismatch, or tensor errors.
+    pub fn prefill_step_with_cache(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: &ModelRepackCache,
+    ) -> Result<(), K3Error> {
+        self.prefill_step_inner(ctx, weights, Some(cache))
+    }
+
+    /// Executes single-token autoregressive decode using a caller-owned [`ModelRepackCache`],
+    /// eliminating per-step `decode_1d_f32` allocations and global cache lookups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if no decode token is staged, context overflows, or tensors mismatch.
+    pub fn decode_step_with_cache(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: &ModelRepackCache,
+    ) -> Result<(), K3Error> {
+        self.decode_step_inner(ctx, weights, Some(cache))
+    }
+
+    fn prefill_step_inner(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: Option<&ModelRepackCache>,
+    ) -> Result<(), K3Error> {
+        let prompt_tokens = ctx.prompt_tokens().to_vec();
+        let prompt_len = prompt_tokens.len();
+        let start_pos = ctx.position();
+        let end_pos = start_pos
+            .checked_add(prompt_len)
+            .ok_or(K3Error::ContextLengthExceeded {
+                requested_tokens: usize::MAX,
+                max_context_tokens: ctx.n_ctx(),
+            })?;
+        if end_pos > ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: end_pos,
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
+
+        let logits_len = ctx.logits().len();
+        let kv_geometry = ctx.kv_geometry();
+        let last_hidden = self.execute_batch_forward(
+            &prompt_tokens,
+            start_pos,
+            ctx.kv_cache_mut(),
+            kv_geometry,
+            weights,
+            logits_len,
+            cache,
+        )?;
+        ctx.advance_position(prompt_len)?;
+        Self::project_logits(ctx, &last_hidden, weights, None, cache)
+    }
+
+    fn decode_step_inner(
+        &self,
+        ctx: &mut ExecutionContext<'_>,
+        weights: &dyn ModelWeights,
+        cache: Option<&ModelRepackCache>,
+    ) -> Result<(), K3Error> {
+        let token = ctx
+            .decode_token()
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: self.architecture_id().to_owned(),
+                reason: "decode_step called without a staged decode token".to_owned(),
+            })?;
+
+        let pos = ctx.position();
+        if pos.saturating_add(1) > ctx.n_ctx() {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: pos.saturating_add(1),
+                max_context_tokens: ctx.n_ctx(),
+            });
+        }
+
+        let logits_len = ctx.logits().len();
+        let kv_geometry = ctx.kv_geometry();
+        let single = [token];
+        let hidden = self.execute_batch_forward(
+            &single,
+            pos,
+            ctx.kv_cache_mut(),
+            kv_geometry,
+            weights,
+            logits_len,
+            cache,
+        )?;
+        ctx.advance_position(1)?;
+        Self::project_logits(ctx, &hidden, weights, Some(token), cache)
+    }
+
     fn resolve_rotary_dim(&self, head_d_even: usize) -> Result<usize, K3Error> {
         let Some(rd) = self.rotary_dim else {
             return Ok(head_d_even);
@@ -671,10 +813,13 @@ impl LlamaRecipe {
         hidden_batch: &mut [f32],
         hidden_dim: usize,
         weights: &dyn ModelWeights,
+        bind_fallback_anchor: bool,
     ) -> Result<(), K3Error> {
         if weights.contains_tensor("token_embd.weight") {
             let emb_tensor = weights.tensor("token_embd.weight")?;
-            set_active_model_anchor(&emb_tensor);
+            if bind_fallback_anchor {
+                set_active_model_anchor(&emb_tensor);
+            }
             let (vocab_rows, _) = resolve_2d_dims(&emb_tensor, hidden_dim)?;
             for (t_idx, &tok_id) in tokens.iter().enumerate() {
                 let row_idx = usize::try_from(tok_id).map_err(|_| K3Error::TensorBoundsError {
@@ -710,30 +855,41 @@ impl LlamaRecipe {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "passes explicit cached 1D norm or fallback tensor name alongside batch dimensions"
+    )]
     fn apply_rmsnorm_batch(
         &self,
         output: &mut [f32],
         input: &[f32],
         norm_name: &str,
+        cached_norm: Option<&Aligned128F32>,
         dim: usize,
         m: usize,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        if !weights.contains_tensor(norm_name) {
-            if weights.tensor_count() == 0 {
-                output.copy_from_slice(input);
-                return Ok(());
+        let owned_fallback;
+        let w_f32: &[f32] = if let Some(cached) = cached_norm {
+            cached.as_slice()
+        } else {
+            if !weights.contains_tensor(norm_name) {
+                if weights.tensor_count() == 0 {
+                    output.copy_from_slice(input);
+                    return Ok(());
+                }
+                return Err(missing_tensor_err(norm_name));
             }
-            return Err(missing_tensor_err(norm_name));
-        }
-        let norm_tensor = weights.tensor(norm_name)?;
-        let w_f32 = decode_1d_f32(&norm_tensor, dim, true)?;
+            let norm_tensor = weights.tensor(norm_name)?;
+            owned_fallback = get_or_decode_1d_f32(&norm_tensor, dim, true)?;
+            owned_fallback.as_slice()
+        };
         let eps = self.rms_eps.max(1.0e-7);
 
         for tok in 0..m {
             let in_row = &input[tok * dim..(tok + 1) * dim];
             let out_row = &mut output[tok * dim..(tok + 1) * dim];
-            rmsnorm_row(out_row, in_row, &w_f32, eps)?;
+            rmsnorm_row(out_row, in_row, w_f32, eps)?;
         }
         Ok(())
     }
@@ -741,6 +897,10 @@ impl LlamaRecipe {
     #[expect(
         clippy::too_many_lines,
         reason = "orchestrates full batched transformer block across QKV, biases, RoPE, KV-cache GQA, and SwiGLU"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal batched forward accepts explicit optional model-scoped cache"
     )]
     fn execute_batch_forward(
         &self,
@@ -750,9 +910,37 @@ impl LlamaRecipe {
         kv_geometry: Option<KvGeometry>,
         weights: &dyn ModelWeights,
         logits_len: usize,
+        cache: Option<&ModelRepackCache>,
     ) -> Result<Vec<f32>, K3Error> {
         let m = tokens.len();
         let geom = self.resolve_geometry(weights, logits_len)?;
+        if let Some(c) = cache
+            && (c.num_layers() != geom.num_layers
+                || c.hidden_dim() != geom.hidden_dim
+                || c.ffn_dim() != geom.ffn_dim
+                || c.total_q() != geom.total_q
+                || c.total_kv() != geom.total_kv)
+        {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "ModelRepackCache".to_owned(),
+                offset: 0,
+                byte_len: c.hidden_dim(),
+                buffer_len: geom.hidden_dim,
+                reason: format!(
+                    "ModelRepackCache geometry (layers={}, hidden={}, ffn={}, q={}, kv={}) mismatches model ({}, {}, {}, {}, {})",
+                    c.num_layers(),
+                    c.hidden_dim(),
+                    c.ffn_dim(),
+                    c.total_q(),
+                    c.total_kv(),
+                    geom.num_layers,
+                    geom.hidden_dim,
+                    geom.ffn_dim,
+                    geom.total_q,
+                    geom.total_kv,
+                ),
+            });
+        }
         if m == 0 {
             return Ok(vec![0.0_f32; geom.hidden_dim]);
         }
@@ -760,7 +948,13 @@ impl LlamaRecipe {
         let synthetic_mode = weights.tensor_count() == 0;
         let end_pos = start_pos + m;
         let mut hidden_batch = vec![0.0_f32; m * geom.hidden_dim];
-        Self::embed_tokens(tokens, &mut hidden_batch, geom.hidden_dim, weights)?;
+        Self::embed_tokens(
+            tokens,
+            &mut hidden_batch,
+            geom.hidden_dim,
+            weights,
+            cache.is_none(),
+        )?;
 
         let inv_freq = precompute_inv_freq_compat(
             geom.rotary_dim,
@@ -786,11 +980,14 @@ impl LlamaRecipe {
         let attn_scale = 1.0_f32 / (geom.head_d_even as f32).sqrt();
 
         for layer in 0..geom.num_layers {
+            let layer_cache = cache.and_then(|c| c.layer(layer));
+
             // 1. Pre-Attention RMSNorm
             self.apply_rmsnorm_batch(
                 &mut norm_batch,
                 &hidden_batch,
                 &format!("blk.{layer}.attn_norm.weight"),
+                layer_cache.map(|lc| &lc.attn_norm),
                 geom.hidden_dim,
                 m,
                 weights,
@@ -806,6 +1003,7 @@ impl LlamaRecipe {
                 geom,
                 m,
                 weights,
+                layer_cache,
             )?;
 
             // 3. Rotary Position Embeddings on BOTH Q and K
@@ -848,27 +1046,14 @@ impl LlamaRecipe {
             )?;
 
             // 5. Batched Attention Output Projection & Residual Connection
-            let attn_out_name = format!("blk.{layer}.attn_output.weight");
-            if weights.contains_tensor(&attn_out_name) {
-                let out_tensor = weights.tensor(&attn_out_name)?;
-                let (rows, cols) = resolve_2d_dims(&out_tensor, geom.total_q)?;
-                if rows != geom.hidden_dim {
-                    return Err(K3Error::TensorBoundsError {
-                        tensor_name: attn_out_name,
-                        offset: out_tensor.offset(),
-                        byte_len: out_tensor.byte_len(),
-                        buffer_len: out_tensor.as_bytes().len(),
-                        reason: format!(
-                            "attn_output rows {rows} != hidden_dim {}",
-                            geom.hidden_dim
-                        ),
-                    });
-                }
-                let cached = get_or_repack(&out_tensor, rows, cols)?;
-                cached.project_batch(&mut proj_hidden_batch, &attn_out_batch, m, true)?;
+            if let Some(lc) = layer_cache {
+                lc.wo
+                    .project_batch(&mut proj_hidden_batch, &attn_out_batch, m, true)?;
                 add_optional_bias(
                     &mut proj_hidden_batch,
                     &format!("blk.{layer}.attn_output.bias"),
+                    lc.attn_output_bias.as_ref(),
+                    true,
                     geom.hidden_dim,
                     m,
                     weights,
@@ -876,17 +1061,49 @@ impl LlamaRecipe {
                 for (h, &p) in hidden_batch.iter_mut().zip(&proj_hidden_batch) {
                     *h += p;
                 }
-            } else if synthetic_mode {
-                for tok in 0..m {
-                    let h_row =
-                        &mut hidden_batch[tok * geom.hidden_dim..(tok + 1) * geom.hidden_dim];
-                    let a_row = &attn_out_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
-                    for (i, h) in h_row.iter_mut().enumerate() {
-                        *h += a_row[i % geom.total_q] * 0.05;
-                    }
-                }
             } else {
-                return Err(missing_tensor_err(&attn_out_name));
+                let attn_out_name = format!("blk.{layer}.attn_output.weight");
+                if weights.contains_tensor(&attn_out_name) {
+                    let out_tensor = weights.tensor(&attn_out_name)?;
+                    let (rows, cols) = resolve_2d_dims(&out_tensor, geom.total_q)?;
+                    if rows != geom.hidden_dim {
+                        return Err(K3Error::TensorBoundsError {
+                            tensor_name: attn_out_name,
+                            offset: out_tensor.offset(),
+                            byte_len: out_tensor.byte_len(),
+                            buffer_len: out_tensor.as_bytes().len(),
+                            reason: format!(
+                                "attn_output rows {rows} != hidden_dim {}",
+                                geom.hidden_dim
+                            ),
+                        });
+                    }
+                    let cached = get_or_repack(&out_tensor, rows, cols)?;
+                    cached.project_batch(&mut proj_hidden_batch, &attn_out_batch, m, true)?;
+                    add_optional_bias(
+                        &mut proj_hidden_batch,
+                        &format!("blk.{layer}.attn_output.bias"),
+                        None,
+                        false,
+                        geom.hidden_dim,
+                        m,
+                        weights,
+                    )?;
+                    for (h, &p) in hidden_batch.iter_mut().zip(&proj_hidden_batch) {
+                        *h += p;
+                    }
+                } else if synthetic_mode {
+                    for tok in 0..m {
+                        let h_row =
+                            &mut hidden_batch[tok * geom.hidden_dim..(tok + 1) * geom.hidden_dim];
+                        let a_row = &attn_out_batch[tok * geom.total_q..(tok + 1) * geom.total_q];
+                        for (i, h) in h_row.iter_mut().enumerate() {
+                            *h += a_row[i % geom.total_q] * 0.05;
+                        }
+                    }
+                } else {
+                    return Err(missing_tensor_err(&attn_out_name));
+                }
             }
 
             // 6. Pre-FFN RMSNorm
@@ -894,6 +1111,7 @@ impl LlamaRecipe {
                 &mut norm_batch,
                 &hidden_batch,
                 &format!("blk.{layer}.ffn_norm.weight"),
+                layer_cache.map(|lc| &lc.ffn_norm),
                 geom.hidden_dim,
                 m,
                 weights,
@@ -911,6 +1129,7 @@ impl LlamaRecipe {
                 geom,
                 m,
                 weights,
+                layer_cache,
             )?;
         }
 
@@ -921,6 +1140,7 @@ impl LlamaRecipe {
             &mut final_hidden,
             last_in,
             "output_norm.weight",
+            cache.map(ModelRepackCache::output_norm),
             geom.hidden_dim,
             1,
             weights,
@@ -934,7 +1154,23 @@ impl LlamaRecipe {
         hidden: &[f32],
         weights: &dyn ModelWeights,
         synthetic_decode_tok: Option<u32>,
+        cache: Option<&ModelRepackCache>,
     ) -> Result<(), K3Error> {
+        if let Some(c) = cache {
+            return match c.lm_head() {
+                LmHeadCache::Repacked(cached) => cached.gemv_rows(ctx.logits_mut(), hidden, true),
+                LmHeadCache::StreamingUntied => {
+                    let output_weight = weights.tensor("output.weight")?;
+                    let layout = PhaseLayout::default();
+                    project_lm_head_row_split(ctx.logits_mut(), hidden, &output_weight, &layout)
+                }
+                LmHeadCache::StreamingTied => {
+                    let tied_weight = weights.tensor("token_embd.weight")?;
+                    let layout = PhaseLayout::default();
+                    project_lm_head_row_split(ctx.logits_mut(), hidden, &tied_weight, &layout)
+                }
+            };
+        }
         if weights.contains_tensor("output.weight") {
             let output_weight = weights.tensor("output.weight")?;
             let layout = PhaseLayout::default();
@@ -1093,34 +1329,7 @@ impl ArchRecipe for LlamaRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        let prompt_tokens = ctx.prompt_tokens().to_vec();
-        let prompt_len = prompt_tokens.len();
-        let start_pos = ctx.position();
-        let end_pos = start_pos
-            .checked_add(prompt_len)
-            .ok_or(K3Error::ContextLengthExceeded {
-                requested_tokens: usize::MAX,
-                max_context_tokens: ctx.n_ctx(),
-            })?;
-        if end_pos > ctx.n_ctx() {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: end_pos,
-                max_context_tokens: ctx.n_ctx(),
-            });
-        }
-
-        let logits_len = ctx.logits().len();
-        let kv_geometry = ctx.kv_geometry();
-        let last_hidden = self.execute_batch_forward(
-            &prompt_tokens,
-            start_pos,
-            ctx.kv_cache_mut(),
-            kv_geometry,
-            weights,
-            logits_len,
-        )?;
-        ctx.advance_position(prompt_len)?;
-        Self::project_logits(ctx, &last_hidden, weights, None)
+        self.prefill_step_inner(ctx, weights, None)
     }
 
     fn decode_step(
@@ -1128,34 +1337,7 @@ impl ArchRecipe for LlamaRecipe {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error> {
-        let token = ctx
-            .decode_token()
-            .ok_or_else(|| K3Error::CapabilityMismatch {
-                architecture: self.architecture_id().to_owned(),
-                reason: "decode_step called without a staged decode token".to_owned(),
-            })?;
-
-        let pos = ctx.position();
-        if pos.saturating_add(1) > ctx.n_ctx() {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: pos.saturating_add(1),
-                max_context_tokens: ctx.n_ctx(),
-            });
-        }
-
-        let logits_len = ctx.logits().len();
-        let kv_geometry = ctx.kv_geometry();
-        let single = [token];
-        let hidden = self.execute_batch_forward(
-            &single,
-            pos,
-            ctx.kv_cache_mut(),
-            kv_geometry,
-            weights,
-            logits_len,
-        )?;
-        ctx.advance_position(1)?;
-        Self::project_logits(ctx, &hidden, weights, Some(token))
+        self.decode_step_inner(ctx, weights, None)
     }
 }
 
@@ -1199,36 +1381,49 @@ fn project_qkv_layer(
     geom: EffectiveGeometry,
     m: usize,
     weights: &dyn ModelWeights,
+    layer_cache: Option<&LayerRepackCache>,
 ) -> Result<(), K3Error> {
-    let q_mat = load_optional_proj_matrix(
-        &format!("blk.{layer}.attn_q.weight"),
-        geom.total_q,
-        geom.hidden_dim,
-        "attn_q",
-        weights,
-    )?;
-    let k_mat = load_optional_proj_matrix(
-        &format!("blk.{layer}.attn_k.weight"),
-        geom.total_kv,
-        geom.hidden_dim,
-        "attn_k",
-        weights,
-    )?;
-    let v_mat = load_optional_proj_matrix(
-        &format!("blk.{layer}.attn_v.weight"),
-        geom.total_kv,
-        geom.hidden_dim,
-        "attn_v",
-        weights,
-    )?;
+    let (q_mat, k_mat, v_mat) = if let Some(lc) = layer_cache {
+        (
+            Some(std::sync::Arc::clone(&lc.wq)),
+            Some(std::sync::Arc::clone(&lc.wk)),
+            Some(std::sync::Arc::clone(&lc.wv)),
+        )
+    } else {
+        (
+            load_optional_proj_matrix(
+                &format!("blk.{layer}.attn_q.weight"),
+                geom.total_q,
+                geom.hidden_dim,
+                "attn_q",
+                weights,
+            )?,
+            load_optional_proj_matrix(
+                &format!("blk.{layer}.attn_k.weight"),
+                geom.total_kv,
+                geom.hidden_dim,
+                "attn_k",
+                weights,
+            )?,
+            load_optional_proj_matrix(
+                &format!("blk.{layer}.attn_v.weight"),
+                geom.total_kv,
+                geom.hidden_dim,
+                "attn_v",
+                weights,
+            )?,
+        )
+    };
 
-    let shared_group = q_mat
-        .as_ref()
-        .and_then(|mat| mat.quant_group_size())
-        .or_else(|| k_mat.as_ref().and_then(|mat| mat.quant_group_size()))
-        .or_else(|| v_mat.as_ref().and_then(|mat| mat.quant_group_size()));
-    let shared_act =
-        shared_group.map(|gs| QuantizedBatchAct::quantize(norm_batch, m, geom.hidden_dim, gs));
+    let shared_act = if q_mat.is_some() || k_mat.is_some() || v_mat.is_some() {
+        Some(QuantizedBatchAct::try_quantize(
+            norm_batch,
+            m,
+            geom.hidden_dim,
+        )?)
+    } else {
+        None
+    };
 
     if let Some(mat) = q_mat {
         mat.project_batch_with_act(q_batch, norm_batch, shared_act.as_ref(), m, true)?;
@@ -1238,6 +1433,8 @@ fn project_qkv_layer(
     add_optional_bias(
         q_batch,
         &format!("blk.{layer}.attn_q.bias"),
+        layer_cache.and_then(|lc| lc.attn_q_bias.as_ref()),
+        layer_cache.is_some(),
         geom.total_q,
         m,
         weights,
@@ -1251,6 +1448,8 @@ fn project_qkv_layer(
     add_optional_bias(
         k_batch,
         &format!("blk.{layer}.attn_k.bias"),
+        layer_cache.and_then(|lc| lc.attn_k_bias.as_ref()),
+        layer_cache.is_some(),
         geom.total_kv,
         m,
         weights,
@@ -1264,6 +1463,8 @@ fn project_qkv_layer(
     add_optional_bias(
         v_batch,
         &format!("blk.{layer}.attn_v.bias"),
+        layer_cache.and_then(|lc| lc.attn_v_bias.as_ref()),
+        layer_cache.is_some(),
         geom.total_kv,
         m,
         weights,
@@ -1466,28 +1667,49 @@ fn execute_layer_swiglu_ffn(
     geom: EffectiveGeometry,
     m: usize,
     weights: &dyn ModelWeights,
+    layer_cache: Option<&LayerRepackCache>,
 ) -> Result<(), K3Error> {
-    let gate_mat = load_optional_proj_matrix(
-        &format!("blk.{layer}.ffn_gate.weight"),
-        geom.ffn_dim,
-        geom.hidden_dim,
-        "ffn_gate",
-        weights,
-    )?;
-    let up_mat = load_optional_proj_matrix(
-        &format!("blk.{layer}.ffn_up.weight"),
-        geom.ffn_dim,
-        geom.hidden_dim,
-        "ffn_up",
-        weights,
-    )?;
+    let (gate_mat, up_mat, down_mat) = if let Some(lc) = layer_cache {
+        (
+            Some(std::sync::Arc::clone(&lc.wgate)),
+            Some(std::sync::Arc::clone(&lc.wup)),
+            Some(std::sync::Arc::clone(&lc.wdown)),
+        )
+    } else {
+        (
+            load_optional_proj_matrix(
+                &format!("blk.{layer}.ffn_gate.weight"),
+                geom.ffn_dim,
+                geom.hidden_dim,
+                "ffn_gate",
+                weights,
+            )?,
+            load_optional_proj_matrix(
+                &format!("blk.{layer}.ffn_up.weight"),
+                geom.ffn_dim,
+                geom.hidden_dim,
+                "ffn_up",
+                weights,
+            )?,
+            load_optional_proj_matrix(
+                &format!("blk.{layer}.ffn_down.weight"),
+                geom.hidden_dim,
+                geom.ffn_dim,
+                "ffn_down",
+                weights,
+            )?,
+        )
+    };
 
-    let shared_group = gate_mat
-        .as_ref()
-        .and_then(|mat| mat.quant_group_size())
-        .or_else(|| up_mat.as_ref().and_then(|mat| mat.quant_group_size()));
-    let shared_act =
-        shared_group.map(|gs| QuantizedBatchAct::quantize(norm_batch, m, geom.hidden_dim, gs));
+    let shared_act = if gate_mat.is_some() || up_mat.is_some() {
+        Some(QuantizedBatchAct::try_quantize(
+            norm_batch,
+            m,
+            geom.hidden_dim,
+        )?)
+    } else {
+        None
+    };
 
     if let Some(mat) = gate_mat {
         mat.project_batch_with_act(gate_batch, norm_batch, shared_act.as_ref(), m, true)?;
@@ -1510,13 +1732,7 @@ fn execute_layer_swiglu_ffn(
 
     swiglu_compat(ffn_act_batch, gate_batch, up_batch)?;
 
-    if let Some(cached) = load_optional_proj_matrix(
-        &format!("blk.{layer}.ffn_down.weight"),
-        geom.hidden_dim,
-        geom.ffn_dim,
-        "ffn_down",
-        weights,
-    )? {
+    if let Some(cached) = down_mat {
         cached.project_batch(proj_hidden_batch, ffn_act_batch, m, true)?;
         for (h, &p) in hidden_batch.iter_mut().zip(&*proj_hidden_batch) {
             *h += p;
@@ -1537,18 +1753,25 @@ fn execute_layer_swiglu_ffn(
 fn add_optional_bias(
     batch: &mut [f32],
     bias_name: &str,
+    cached_bias: Option<&Aligned128F32>,
+    has_layer_cache: bool,
     dim: usize,
     m: usize,
     weights: &dyn ModelWeights,
 ) -> Result<(), K3Error> {
-    if !weights.contains_tensor(bias_name) {
+    let owned_fallback;
+    let bias: &[f32] = if let Some(cached) = cached_bias {
+        cached.as_slice()
+    } else if has_layer_cache || !weights.contains_tensor(bias_name) {
         return Ok(());
-    }
-    let bias_tensor = weights.tensor(bias_name)?;
-    let bias = decode_1d_f32(&bias_tensor, dim, false)?;
+    } else {
+        let bias_tensor = weights.tensor(bias_name)?;
+        owned_fallback = get_or_decode_1d_f32(&bias_tensor, dim, false)?;
+        owned_fallback.as_slice()
+    };
     for tok in 0..m {
         let row = &mut batch[tok * dim..(tok + 1) * dim];
-        for (slot, &b) in row.iter_mut().zip(&bias) {
+        for (slot, &b) in row.iter_mut().zip(bias) {
             *slot += b;
         }
     }
