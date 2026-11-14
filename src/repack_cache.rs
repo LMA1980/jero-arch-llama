@@ -18,12 +18,12 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use jero_core::{K3Error, ModelWeights, QuantType, TensorView};
+use jero_core::{K3Error, ModelWeights, QuantType, ScratchScope, TensorView};
 
 #[cfg(feature = "with-kernels")]
 pub use jero_kernels_rvv::repack::Aligned128;
 #[cfg(feature = "with-kernels")]
-use jero_kernels_rvv::repack::{QuantizedActQ8, RepackedWeight};
+use jero_kernels_rvv::repack::{QuantizedActQ8, QuantizedActQ8View, RepackedWeight};
 #[cfg(feature = "with-kernels")]
 use jero_kernels_rvv::{
     BaselineKernel, Q4_K_M_BLOCK_BYTES, Q4_K_M_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
@@ -379,6 +379,97 @@ mod portable {
         scales_32: Vec<f32>,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    pub(in crate::repack_cache) struct QuantizedActQ8View<'a> {
+        k: usize,
+        f32_rows: &'a [f32],
+        q8_32_rows: &'a [i8],
+        scales_32: &'a [f32],
+    }
+
+    fn quantize_single_row_slices(
+        src: &[f32],
+        k: usize,
+        blocks32_per_row: usize,
+        dst_f32: &mut [f32],
+        dst_q8: &mut [i8],
+        dst_scales: &mut [f32],
+    ) {
+        for (dst, &v) in dst_f32.iter_mut().zip(src) {
+            *dst = if v.is_finite() { v } else { 0.0_f32 };
+        }
+        for (b, dst_scale) in dst_scales.iter_mut().enumerate().take(blocks32_per_row) {
+            let c_start = b * 32;
+            let c_end = (c_start + 32).min(k);
+            let mut amax = 0.0_f32;
+            for &v in &dst_f32[c_start..c_end] {
+                amax = amax.max(v.abs());
+            }
+            let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            let dst_q = &mut dst_q8[c_start..];
+            for (idx, &v) in dst_f32[c_start..c_end].iter().enumerate() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "clamped Q8 activation fits in i8"
+                )]
+                {
+                    dst_q[idx] = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+            *dst_scale = scale;
+        }
+    }
+
+    impl<'a> QuantizedActQ8View<'a> {
+        pub(in crate::repack_cache) const fn scratch_bytes_for_row(k: usize) -> usize {
+            if k == 0 {
+                return 0;
+            }
+            let blocks32_per_row = k.div_ceil(32);
+            let k_padded = blocks32_per_row.saturating_mul(32);
+            let s0 = k_padded
+                .saturating_mul(size_of::<f32>())
+                .next_multiple_of(128);
+            let s1 = k_padded.next_multiple_of(128);
+            let s2 = blocks32_per_row
+                .saturating_mul(size_of::<f32>())
+                .next_multiple_of(128);
+            128_usize
+                .saturating_add(s0)
+                .saturating_add(s1)
+                .saturating_add(s2)
+        }
+
+        pub(in crate::repack_cache) fn quantize_row_in_scope(
+            act: &[f32],
+            scope: &'a super::ScratchScope<'_>,
+        ) -> Result<Self, K3Error> {
+            let k = act.len();
+            if k == 0 {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "QuantizedActQ8View".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: 0,
+                    reason: "activation length must be non-empty".to_owned(),
+                });
+            }
+            let blocks32_per_row = k.div_ceil(32);
+            let k_padded = blocks32_per_row * 32;
+            let f32_rows = scope.alloc_f32_zeroed(k_padded)?;
+            let q8_32_rows = scope.alloc_i8_zeroed(k_padded)?;
+            let scales_32 = scope.alloc_f32_zeroed(blocks32_per_row)?;
+            quantize_single_row_slices(act, k, blocks32_per_row, f32_rows, q8_32_rows, scales_32);
+            Ok(Self {
+                k,
+                f32_rows,
+                q8_32_rows,
+                scales_32,
+            })
+        }
+    }
+
     impl QuantizedActQ8 {
         pub(super) const fn new() -> Self {
             Self {
@@ -431,30 +522,10 @@ mod portable {
                 let dst_f32 = Aligned128::slice_as_f32_mut(
                     &mut self.f32_rows[tok * blocks32_per_row..(tok + 1) * blocks32_per_row],
                 );
-                for (dst, &v) in dst_f32.iter_mut().zip(src) {
-                    *dst = if v.is_finite() { v } else { 0.0_f32 };
-                }
-                for b in 0..blocks32_per_row {
-                    let c_start = b * 32;
-                    let c_end = (c_start + 32).min(k);
-                    let mut amax = 0.0_f32;
-                    for &v in &dst_f32[c_start..c_end] {
-                        amax = amax.max(v.abs());
-                    }
-                    let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
-                    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-                    let dst_q = &mut self.q8_32_rows[tok * k_padded + c_start..];
-                    for (idx, &v) in dst_f32[c_start..c_end].iter().enumerate() {
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "clamped Q8 activation fits in i8"
-                        )]
-                        {
-                            dst_q[idx] = (v * inv).round().clamp(-127.0, 127.0) as i8;
-                        }
-                    }
-                    self.scales_32[tok * blocks32_per_row + b] = scale;
-                }
+                let dst_q8 = &mut self.q8_32_rows[tok * k_padded..(tok + 1) * k_padded];
+                let dst_scales =
+                    &mut self.scales_32[tok * blocks32_per_row..(tok + 1) * blocks32_per_row];
+                quantize_single_row_slices(src, k, blocks32_per_row, dst_f32, dst_q8, dst_scales);
             }
             Ok(())
         }
@@ -641,6 +712,99 @@ mod portable {
             }
         }
 
+        fn eval_row_range(
+            &self,
+            out_row: &mut [f32],
+            a_f32: &[f32],
+            a_q8: &[i8],
+            a_sc: &[f32],
+            row_range: Range<usize>,
+        ) {
+            match &self.storage {
+                PortableStorage::DenseF32 {
+                    blocks_per_row,
+                    data,
+                } => {
+                    for (local_r, r) in row_range.enumerate() {
+                        let w_row = Aligned128::slice_as_f32(
+                            &data[r * *blocks_per_row..(r + 1) * *blocks_per_row],
+                        );
+                        let mut acc = 0.0_f32;
+                        for c in 0..self.cols {
+                            acc += w_row[c] * a_f32[c];
+                        }
+                        out_row[local_r] = acc;
+                    }
+                }
+                PortableStorage::BlockScaledI8 {
+                    k_chunks,
+                    chunks_per_scale,
+                    scale_groups,
+                    tiles,
+                    scales,
+                    mins,
+                    ..
+                } => {
+                    let group_elems = *chunks_per_scale * TILE_K;
+                    for (local_r, r) in row_range.enumerate() {
+                        let (nt, j) = (r / TILE_N, r % TILE_N);
+                        let mut acc = 0.0_f32;
+                        for ch in 0..*k_chunks {
+                            let sg = ch / *chunks_per_scale;
+                            let b32 = ch / 2;
+                            let w_sc = scales[(nt * *scale_groups + sg) * TILE_N + j];
+                            let b_tile = tiles[nt * *k_chunks + ch].as_i8();
+                            let bj = &b_tile[j * TILE_K..(j + 1) * TILE_K];
+                            let ai = &a_q8[ch * TILE_K..(ch + 1) * TILE_K];
+                            let mut dot_i32 = 0_i32;
+                            for idx in 0..TILE_K {
+                                dot_i32 += i32::from(ai[idx]) * i32::from(bj[idx]);
+                            }
+                            #[expect(
+                                clippy::cast_precision_loss,
+                                reason = "16-elem i8*i8 dot fits exact in f32"
+                            )]
+                            let dot_f = dot_i32 as f32;
+                            acc += dot_f * a_sc[b32] * w_sc;
+                            if ch % *chunks_per_scale == 0
+                                && let Some(mins_vec) = mins
+                            {
+                                let w_mn = mins_vec[(nt * *scale_groups + sg) * TILE_N + j];
+                                let seg = &a_f32[sg * group_elems..(sg + 1) * group_elems];
+                                let mut x_sum = 0.0_f32;
+                                for &v in seg {
+                                    x_sum += v;
+                                }
+                                acc -= x_sum * w_mn;
+                            }
+                        }
+                        out_row[local_r] = acc;
+                    }
+                }
+            }
+        }
+
+        pub(super) fn gemv_view_rows(
+            &self,
+            out: &mut [f32],
+            act: &QuantizedActQ8View<'_>,
+            row_range: Range<usize>,
+        ) -> Result<(), K3Error> {
+            let sub_n = row_range.len();
+            if act.k != self.cols || row_range.end > self.rows || out.len() != sub_n {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: "PortableRepackedWeight".to_owned(),
+                    offset: 0,
+                    byte_len: size_of_val(out),
+                    buffer_len: sub_n * size_of::<f32>(),
+                    reason: "gemv_view_rows dimension mismatch".to_owned(),
+                });
+            }
+            out.fill(0.0);
+            self.eval_row_range(out, act.f32_rows, act.q8_32_rows, act.scales_32, row_range);
+            Ok(())
+        }
+
         pub(super) fn gemm_rows(
             &self,
             out: &mut [f32],
@@ -658,85 +822,16 @@ mod portable {
                     reason: "gemm_rows dimension mismatch".to_owned(),
                 });
             }
-            match &self.storage {
-                PortableStorage::DenseF32 {
-                    blocks_per_row,
-                    data,
-                } => {
-                    for tok in 0..m {
-                        let x_row = Aligned128::slice_as_f32(
-                            &act.f32_rows
-                                [tok * act.blocks32_per_row..(tok + 1) * act.blocks32_per_row],
-                        );
-                        let out_row = &mut out[tok * sub_n..(tok + 1) * sub_n];
-                        for (local_r, r) in row_range.clone().enumerate() {
-                            let w_row = Aligned128::slice_as_f32(
-                                &data[r * *blocks_per_row..(r + 1) * *blocks_per_row],
-                            );
-                            let mut acc = 0.0_f32;
-                            for c in 0..self.cols {
-                                acc += w_row[c] * x_row[c];
-                            }
-                            out_row[local_r] = acc;
-                        }
-                    }
-                }
-                PortableStorage::BlockScaledI8 {
-                    k_chunks,
-                    chunks_per_scale,
-                    scale_groups,
-                    tiles,
-                    scales,
-                    mins,
-                    ..
-                } => {
-                    out.fill(0.0);
-                    let group_elems = *chunks_per_scale * TILE_K;
-                    let k_padded_q8 = act.blocks32_per_row * 32;
-                    for tok in 0..m {
-                        let a_q8 = &act.q8_32_rows[tok * k_padded_q8..];
-                        let a_f32 = Aligned128::slice_as_f32(
-                            &act.f32_rows
-                                [tok * act.blocks32_per_row..(tok + 1) * act.blocks32_per_row],
-                        );
-                        let a_sc = &act.scales_32[tok * act.blocks32_per_row..];
-                        let out_row = &mut out[tok * sub_n..(tok + 1) * sub_n];
-                        for (local_r, r) in row_range.clone().enumerate() {
-                            let (nt, j) = (r / TILE_N, r % TILE_N);
-                            let mut acc = 0.0_f32;
-                            for ch in 0..*k_chunks {
-                                let sg = ch / *chunks_per_scale;
-                                let b32 = ch / 2;
-                                let w_sc = scales[(nt * *scale_groups + sg) * TILE_N + j];
-                                let b_tile = tiles[nt * *k_chunks + ch].as_i8();
-                                let bj = &b_tile[j * TILE_K..(j + 1) * TILE_K];
-                                let ai = &a_q8[ch * TILE_K..(ch + 1) * TILE_K];
-                                let mut dot_i32 = 0_i32;
-                                for idx in 0..TILE_K {
-                                    dot_i32 += i32::from(ai[idx]) * i32::from(bj[idx]);
-                                }
-                                #[expect(
-                                    clippy::cast_precision_loss,
-                                    reason = "16-elem i8*i8 dot fits exact in f32"
-                                )]
-                                let dot_f = dot_i32 as f32;
-                                acc += dot_f * a_sc[b32] * w_sc;
-                                if ch % *chunks_per_scale == 0
-                                    && let Some(mins_vec) = mins
-                                {
-                                    let w_mn = mins_vec[(nt * *scale_groups + sg) * TILE_N + j];
-                                    let seg = &a_f32[sg * group_elems..(sg + 1) * group_elems];
-                                    let mut x_sum = 0.0_f32;
-                                    for &v in seg {
-                                        x_sum += v;
-                                    }
-                                    acc -= x_sum * w_mn;
-                                }
-                            }
-                            out_row[local_r] = acc;
-                        }
-                    }
-                }
+            out.fill(0.0);
+            let k_padded_q8 = act.blocks32_per_row * 32;
+            for tok in 0..m {
+                let a_q8 = &act.q8_32_rows[tok * k_padded_q8..];
+                let a_f32 = Aligned128::slice_as_f32(
+                    &act.f32_rows[tok * act.blocks32_per_row..(tok + 1) * act.blocks32_per_row],
+                );
+                let a_sc = &act.scales_32[tok * act.blocks32_per_row..];
+                let out_row = &mut out[tok * sub_n..(tok + 1) * sub_n];
+                self.eval_row_range(out_row, a_f32, a_q8, a_sc, row_range.clone());
             }
             Ok(())
         }
@@ -907,7 +1002,7 @@ pub use portable::{
     Aligned128, dequantize_q4_0_block, dequantize_q5_0_block, dequantize_q5_k_block,
 };
 #[cfg(not(feature = "with-kernels"))]
-use portable::{QuantizedActQ8, RepackedWeight};
+use portable::{QuantizedActQ8, QuantizedActQ8View, RepackedWeight};
 #[cfg(not(feature = "with-kernels"))]
 pub(crate) use portable::{
     bf16_to_f32_finite, dequantize_q4_k_m_block, dequantize_q6_k_block, dequantize_q8_0_block,
@@ -1532,6 +1627,66 @@ impl CachedMatrix {
         }
     }
 
+    /// Executes single-token GEMV (`[1, cols] x [rows, cols]^T -> [rows]`) over a reusable
+    /// [`DecodeActQ8View`] backed by [`ScratchScope`] with zero heap allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] when dimensions do not match `self.rows()` / `self.cols()`.
+    pub fn gemv_with_act_view(
+        &self,
+        output: &mut [f32],
+        act: &DecodeActQ8View<'_>,
+        parallel: bool,
+    ) -> Result<(), K3Error> {
+        let input = act.raw_f32();
+        if output.len() != self.rows || input.len() != self.cols {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "CachedMatrix".to_owned(),
+                offset: 0,
+                byte_len: output.len(),
+                buffer_len: self.rows,
+                reason: format!(
+                    "CachedMatrix GEMV dimension mismatch: rows={}, cols={}, in={}, out={}",
+                    self.rows,
+                    self.cols,
+                    input.len(),
+                    output.len()
+                ),
+            });
+        }
+        if self.rows == 0 {
+            return Ok(());
+        }
+        match &self.storage {
+            CachedStorage::StreamingDense { quant, raw } => {
+                project_streaming_dense(
+                    output, input, raw, *quant, 1, self.rows, self.cols, parallel,
+                );
+                Ok(())
+            }
+            CachedStorage::Repacked(repacked) => {
+                run_repacked_gemv_view_panels(repacked, output, &act.view, self.rows, parallel)
+            }
+        }
+    }
+
+    /// Quantizes `input` inside `scope` and executes zero-allocation `M = 1` GEMV.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on dimension or scratch capacity mismatch.
+    pub fn gemv_in_scope(
+        &self,
+        output: &mut [f32],
+        input: &[f32],
+        scope: &ScratchScope<'_>,
+        parallel: bool,
+    ) -> Result<(), K3Error> {
+        let act = DecodeActQ8View::quantize_row_in_scope(input, scope)?;
+        self.gemv_with_act_view(output, &act, parallel)
+    }
+
     /// Executes single-token GEMV (`[1, cols] x [rows, cols]^T -> [rows]`).
     ///
     /// # Errors
@@ -1632,6 +1787,42 @@ impl CachedMatrix {
     }
 }
 
+/// Zero-allocation, [`ScratchScope`]-backed `M = 1` activation view matching `RepackedWeight`
+/// tile and `32`-element (`16`-element for `Q6_K`) quantization group layouts.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeActQ8View<'a> {
+    raw_f32: &'a [f32],
+    view: QuantizedActQ8View<'a>,
+}
+
+impl<'a> DecodeActQ8View<'a> {
+    /// Returns the conservative `128`-byte-aligned [`ScratchScope`] budget for `[1, k]` activation
+    /// quantization.
+    #[must_use]
+    pub const fn scratch_bytes_for_row(k: usize) -> usize {
+        QuantizedActQ8View::scratch_bytes_for_row(k)
+    }
+
+    /// Quantizes `[1, act.len()]` into caller `scope` with zero heap allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if `act` is empty or exceeds `scope` capacity.
+    pub fn quantize_row_in_scope(
+        act: &'a [f32],
+        scope: &'a ScratchScope<'_>,
+    ) -> Result<Self, K3Error> {
+        let view = QuantizedActQ8View::quantize_row_in_scope(act, scope)?;
+        Ok(Self { raw_f32: act, view })
+    }
+
+    /// Returns the original `f32` activation slice (`[cols]`).
+    #[must_use]
+    pub const fn raw_f32(&self) -> &'a [f32] {
+        self.raw_f32
+    }
+}
+
 const MAX_STACK_PANEL_ELEMS: usize = PANEL_ROWS * 32;
 
 thread_local! {
@@ -1697,6 +1888,44 @@ fn with_worker_panel_scratch<R>(needed_elems: usize, f: impl FnOnce(&mut [f32]) 
         }
         f(&mut guard[..needed_elems])
     })
+}
+
+#[cfg(not(miri))]
+fn join_repacked_gemv_view_panels(
+    repacked: &RepackedWeight,
+    output: &mut [f32],
+    act: &QuantizedActQ8View<'_>,
+    row_start: usize,
+) -> Result<(), K3Error> {
+    let rows = output.len();
+    if rows <= PANEL_ROWS {
+        return repacked.gemv_view_rows(output, act, row_start..row_start + rows);
+    }
+    let panel_count = rows.div_ceil(PANEL_ROWS);
+    let left_panels = panel_count / 2;
+    let mid = (left_panels * PANEL_ROWS).min(rows);
+    let (out_lo, out_hi) = output.split_at_mut(mid);
+    let (res_lo, res_hi) = rayon::join(
+        || join_repacked_gemv_view_panels(repacked, out_lo, act, row_start),
+        || join_repacked_gemv_view_panels(repacked, out_hi, act, row_start + mid),
+    );
+    res_lo?;
+    res_hi
+}
+
+fn run_repacked_gemv_view_panels(
+    repacked: &RepackedWeight,
+    output: &mut [f32],
+    act: &QuantizedActQ8View<'_>,
+    rows: usize,
+    parallel: bool,
+) -> Result<(), K3Error> {
+    #[cfg(not(miri))]
+    if parallel && rows > PANEL_ROWS && rayon::current_num_threads() > 1 {
+        return join_repacked_gemv_view_panels(repacked, output, act, 0);
+    }
+    let _ = parallel;
+    repacked.gemv_view_rows(output, act, 0..rows)
 }
 
 fn run_repacked_gemm_panels(
@@ -1765,11 +1994,9 @@ fn project_streaming_dense(
     if m == 1 {
         par_for_each_row_tile(output, PANEL_ROWS, parallel, |panel_idx, slice| {
             let row_start = panel_idx * PANEL_ROWS;
-            let mut local_scratch = vec![0.0_f32; cols];
             for (local_r, slot) in slice.iter_mut().enumerate() {
                 let row_raw = &raw[(row_start + local_r) * stride_bytes..][..stride_bytes];
-                decode_dense_row_into(quant, row_raw, &mut local_scratch);
-                *slot = dot_f32(&local_scratch, input);
+                *slot = crate::decode_gemv::dot_dense_row_zero_alloc(quant, row_raw, input);
             }
         });
         return;
@@ -1810,6 +2037,25 @@ fn decode_dense_row_into(quant: QuantType, row_raw: &[u8], scratch: &mut [f32]) 
     }
 }
 
+#[cfg(not(miri))]
+fn join_row_tiles<F>(output: &mut [f32], chunk_size: usize, base_idx: usize, op: &F)
+where
+    F: Fn(usize, &mut [f32]) + Sync,
+{
+    if output.len() <= chunk_size {
+        op(base_idx, output);
+        return;
+    }
+    let chunk_count = output.len().div_ceil(chunk_size);
+    let left_chunks = chunk_count / 2;
+    let mid = (left_chunks * chunk_size).min(output.len());
+    let (lo, hi) = output.split_at_mut(mid);
+    rayon::join(
+        || join_row_tiles(lo, chunk_size, base_idx, op),
+        || join_row_tiles(hi, chunk_size, base_idx + left_chunks, op),
+    );
+}
+
 /// Executes `op(panel_idx, chunk)` across contiguous `chunk_size` slices of `output`,
 /// using `rayon` on the active cluster `WorkerPool` when `parallel && not(miri)` and
 /// `rayon::current_num_threads() > 1`, or sequentially on the calling thread otherwise.
@@ -1823,11 +2069,7 @@ where
 
     #[cfg(not(miri))]
     if parallel && output.len() > chunk_size && rayon::current_num_threads() > 1 {
-        use rayon::prelude::*;
-        output
-            .par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(idx, slice)| op(idx, slice));
+        join_row_tiles(output, chunk_size, 0, &op);
         return;
     }
 
@@ -1891,12 +2133,26 @@ pub struct ModelRepackCache {
     total_q: usize,
     total_kv: usize,
     vocab_size: usize,
+    source_tensor_count: usize,
+    key_table: crate::decode_gemv::LayerKeyTable,
     layers: Vec<LayerRepackCache>,
     output_norm: Aligned128F32,
     lm_head: LmHeadCache,
 }
 
 impl ModelRepackCache {
+    /// Returns the pre-computed per-layer GGUF tensor key table (`blk.{layer}.*`).
+    #[must_use]
+    pub const fn layer_keys(&self) -> &crate::decode_gemv::LayerKeyTable {
+        &self.key_table
+    }
+
+    /// Returns the `ModelWeights::tensor_count()` observed when this cache was constructed.
+    #[must_use]
+    pub const fn source_tensor_count(&self) -> usize {
+        self.source_tensor_count
+    }
+
     /// Builds a model-scoped cache from `weights` using explicit resolved dimensions.
     ///
     /// # Errors
@@ -1917,64 +2173,35 @@ impl ModelRepackCache {
         vocab_size: usize,
         weights: &dyn ModelWeights,
     ) -> Result<Self, K3Error> {
+        let key_table = crate::decode_gemv::LayerKeyTable::new(num_layers);
         let mut layers = Vec::with_capacity(num_layers);
         for l in 0..num_layers {
-            let attn_norm_t = weights.tensor(&format!("blk.{l}.attn_norm.weight"))?;
+            let keys = key_table.get(l).ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "blk.attn_norm.weight".to_owned(),
+                offset: 0,
+                byte_len: l,
+                buffer_len: key_table.len(),
+                reason: "layer key index out of bounds".to_owned(),
+            })?;
+            let attn_norm_t = weights.tensor(&keys.attn_norm)?;
             let attn_norm = Aligned128F32::from_tensor(&attn_norm_t, hidden_dim, true)?;
 
-            let ffn_norm_t = weights.tensor(&format!("blk.{l}.ffn_norm.weight"))?;
+            let ffn_norm_t = weights.tensor(&keys.ffn_norm)?;
             let ffn_norm = Aligned128F32::from_tensor(&ffn_norm_t, hidden_dim, true)?;
 
-            let wq = repack_checked_2d(
-                weights,
-                &format!("blk.{l}.attn_q.weight"),
-                hidden_dim,
-                total_q,
-            )?;
-            let wk = repack_checked_2d(
-                weights,
-                &format!("blk.{l}.attn_k.weight"),
-                hidden_dim,
-                total_kv,
-            )?;
-            let wv = repack_checked_2d(
-                weights,
-                &format!("blk.{l}.attn_v.weight"),
-                hidden_dim,
-                total_kv,
-            )?;
-            let wo = repack_checked_2d(
-                weights,
-                &format!("blk.{l}.attn_output.weight"),
-                total_q,
-                hidden_dim,
-            )?;
+            let wq = repack_checked_2d(weights, &keys.attn_q, hidden_dim, total_q)?;
+            let wk = repack_checked_2d(weights, &keys.attn_k, hidden_dim, total_kv)?;
+            let wv = repack_checked_2d(weights, &keys.attn_v, hidden_dim, total_kv)?;
+            let wo = repack_checked_2d(weights, &keys.attn_output, total_q, hidden_dim)?;
 
-            let bias_query = decode_optional_1d(weights, &format!("blk.{l}.attn_q.bias"), total_q)?;
-            let bias_key = decode_optional_1d(weights, &format!("blk.{l}.attn_k.bias"), total_kv)?;
-            let bias_value =
-                decode_optional_1d(weights, &format!("blk.{l}.attn_v.bias"), total_kv)?;
-            let bias_output =
-                decode_optional_1d(weights, &format!("blk.{l}.attn_output.bias"), hidden_dim)?;
+            let bias_query = decode_optional_1d(weights, &keys.attn_q_bias, total_q)?;
+            let bias_key = decode_optional_1d(weights, &keys.attn_k_bias, total_kv)?;
+            let bias_value = decode_optional_1d(weights, &keys.attn_v_bias, total_kv)?;
+            let bias_output = decode_optional_1d(weights, &keys.attn_output_bias, hidden_dim)?;
 
-            let wgate = repack_checked_2d(
-                weights,
-                &format!("blk.{l}.ffn_gate.weight"),
-                hidden_dim,
-                ffn_dim,
-            )?;
-            let wup = repack_checked_2d(
-                weights,
-                &format!("blk.{l}.ffn_up.weight"),
-                hidden_dim,
-                ffn_dim,
-            )?;
-            let wdown = repack_checked_2d(
-                weights,
-                &format!("blk.{l}.ffn_down.weight"),
-                ffn_dim,
-                hidden_dim,
-            )?;
+            let wgate = repack_checked_2d(weights, &keys.ffn_gate, hidden_dim, ffn_dim)?;
+            let wup = repack_checked_2d(weights, &keys.ffn_up, hidden_dim, ffn_dim)?;
+            let wdown = repack_checked_2d(weights, &keys.ffn_down, ffn_dim, hidden_dim)?;
 
             layers.push(LayerRepackCache {
                 attn_norm,
@@ -2021,6 +2248,8 @@ impl ModelRepackCache {
             total_q,
             total_kv,
             vocab_size,
+            source_tensor_count: weights.tensor_count(),
+            key_table,
             layers,
             output_norm,
             lm_head,
@@ -2183,7 +2412,7 @@ fn decode_optional_1d(
     Ok(Some(Aligned128F32::from_tensor(&t, expected_len, false)?))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheKey {
     name: String,
     quant: QuantType,
@@ -2192,6 +2421,18 @@ struct CacheKey {
     byte_len: usize,
     ptr_addr: usize,
     content_hash: u64,
+}
+
+impl CacheKey {
+    fn matches(&self, tensor: &TensorView<'_>, ptr_addr: usize, content_hash: u64) -> bool {
+        self.ptr_addr == ptr_addr
+            && self.content_hash == content_hash
+            && self.offset == tensor.offset()
+            && self.byte_len == tensor.byte_len()
+            && self.quant == tensor.quant()
+            && self.shape.as_slice() == tensor.shape()
+            && self.name == tensor.name()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2203,11 +2444,149 @@ struct ModelAnchor {
     content_hash: u64,
 }
 
+impl ModelAnchor {
+    fn matches(&self, tensor: &TensorView<'_>, ptr_addr: usize, content_hash: u64) -> bool {
+        self.ptr_addr == ptr_addr
+            && self.content_hash == content_hash
+            && self.quant == tensor.quant()
+            && self.shape.as_slice() == tensor.shape()
+            && self.name == tensor.name()
+    }
+}
+
+struct ZeroAllocBucketMap<V> {
+    buckets: HashMap<u64, Vec<(CacheKey, V)>>,
+    count: usize,
+}
+
+impl<V> Default for ZeroAllocBucketMap<V> {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            count: 0,
+        }
+    }
+}
+
+impl<V> ZeroAllocBucketMap<V> {
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+        self.count = 0;
+    }
+
+    fn get_borrowed(
+        &self,
+        hash: u64,
+        tensor: &TensorView<'_>,
+        ptr_addr: usize,
+        content_hash: u64,
+    ) -> Option<&V> {
+        let bucket = self.buckets.get(&hash)?;
+        for (key, val) in bucket {
+            if key.matches(tensor, ptr_addr, content_hash) {
+                return Some(val);
+            }
+        }
+        None
+    }
+
+    fn get_or_insert_with_tensor(
+        &mut self,
+        hash: u64,
+        tensor: &TensorView<'_>,
+        ptr_addr: usize,
+        content_hash: u64,
+        val: V,
+    ) -> &V {
+        let bucket = self.buckets.entry(hash).or_default();
+        if let Some(pos) = bucket
+            .iter()
+            .position(|(k, _)| k.matches(tensor, ptr_addr, content_hash))
+        {
+            return &bucket[pos].1;
+        }
+        bucket.push((make_cache_key_with_raw(tensor, ptr_addr, content_hash), val));
+        self.count += 1;
+        &bucket[bucket.len() - 1].1
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CachedLayerBiasFlags(u8);
+
+impl CachedLayerBiasFlags {
+    const Q: u8 = 1 << 0;
+    const K: u8 = 1 << 1;
+    const V: u8 = 1 << 2;
+    const O: u8 = 1 << 3;
+
+    #[must_use]
+    pub(crate) const fn from_qkvo([q, k, v, o]: [bool; 4]) -> Self {
+        let mut mask = 0_u8;
+        if q {
+            mask |= Self::Q;
+        }
+        if k {
+            mask |= Self::K;
+        }
+        if v {
+            mask |= Self::V;
+        }
+        if o {
+            mask |= Self::O;
+        }
+        Self(mask)
+    }
+
+    #[must_use]
+    pub(crate) const fn has_q(self) -> bool {
+        (self.0 & Self::Q) != 0
+    }
+
+    #[must_use]
+    pub(crate) const fn has_k(self) -> bool {
+        (self.0 & Self::K) != 0
+    }
+
+    #[must_use]
+    pub(crate) const fn has_v(self) -> bool {
+        (self.0 & Self::V) != 0
+    }
+
+    #[must_use]
+    pub(crate) const fn has_o(self) -> bool {
+        (self.0 & Self::O) != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CachedFallbackGeometry {
+    pub architecture: &'static str,
+    pub rotary_dim_cfg: Option<usize>,
+    pub logits_len: usize,
+    pub num_layers: usize,
+    pub hidden_dim: usize,
+    pub ffn_dim: usize,
+    pub n_heads_q: usize,
+    pub n_heads_kv: usize,
+    pub head_d_even: usize,
+    pub rotary_dim: usize,
+    pub total_q: usize,
+    pub total_kv: usize,
+    pub has_output_weight: bool,
+}
+
 #[derive(Default)]
 struct ActiveModelFallbackCache {
     anchor: Option<ModelAnchor>,
-    matrices: HashMap<CacheKey, Arc<CachedMatrix>>,
-    vectors_1d: HashMap<CacheKey, Arc<Aligned128F32>>,
+    matrices: ZeroAllocBucketMap<Arc<CachedMatrix>>,
+    vectors_1d: ZeroAllocBucketMap<Arc<Aligned128F32>>,
+    model_meta: Option<CachedFallbackGeometry>,
+    layer_biases: Vec<CachedLayerBiasFlags>,
 }
 
 static ACTIVE_FALLBACK_CACHE: OnceLock<RwLock<ActiveModelFallbackCache>> = OnceLock::new();
@@ -2237,27 +2616,53 @@ fn hash_bytes_sample(bytes: &[u8]) -> u64 {
     h
 }
 
-fn make_cache_key(tensor: &TensorView<'_>) -> CacheKey {
-    let raw = tensor.as_bytes();
+#[inline]
+fn hash_cache_lookup(tensor: &TensorView<'_>, ptr_addr: usize, content_hash: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mix_slice = |acc: &mut u64, slice: &[u8]| {
+        for &b in slice {
+            *acc ^= u64::from(b);
+            *acc = acc.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    mix_slice(&mut h, tensor.name().as_bytes());
+    mix_slice(&mut h, &ptr_addr.to_le_bytes());
+    mix_slice(&mut h, &content_hash.to_le_bytes());
+    mix_slice(&mut h, &tensor.offset().to_le_bytes());
+    mix_slice(&mut h, &tensor.byte_len().to_le_bytes());
+    for &dim in tensor.shape() {
+        mix_slice(&mut h, &dim.to_le_bytes());
+    }
+    h
+}
+
+fn make_cache_key_with_raw(
+    tensor: &TensorView<'_>,
+    ptr_addr: usize,
+    content_hash: u64,
+) -> CacheKey {
     CacheKey {
         name: tensor.name().to_owned(),
         quant: tensor.quant(),
         shape: tensor.shape().to_vec(),
         offset: tensor.offset(),
         byte_len: tensor.byte_len(),
-        ptr_addr: raw.as_ptr() as usize,
-        content_hash: hash_bytes_sample(raw),
+        ptr_addr,
+        content_hash,
     }
 }
 
-fn make_anchor(tensor: &TensorView<'_>) -> ModelAnchor {
-    let raw = tensor.as_bytes();
+fn make_anchor_with_raw(
+    tensor: &TensorView<'_>,
+    ptr_addr: usize,
+    content_hash: u64,
+) -> ModelAnchor {
     ModelAnchor {
         name: tensor.name().to_owned(),
         quant: tensor.quant(),
         shape: tensor.shape().to_vec(),
-        ptr_addr: raw.as_ptr() as usize,
-        content_hash: hash_bytes_sample(raw),
+        ptr_addr,
+        content_hash,
     }
 }
 
@@ -2265,13 +2670,30 @@ fn make_anchor(tensor: &TensorView<'_>) -> ModelAnchor {
 /// for trait-method calls (`ArchRecipe::prefill_step`/`decode_step`) that do not pass an explicit
 /// [`ModelRepackCache`]; evicts stale cached matrices and 1D vectors automatically on model switch.
 pub fn set_active_model_anchor(anchor_tensor: &TensorView<'_>) {
-    let next = make_anchor(anchor_tensor);
+    let raw = anchor_tensor.as_bytes();
+    let ptr_addr = raw.as_ptr() as usize;
+    let content_hash = hash_bytes_sample(raw);
+    {
+        let guard = fallback_cache()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard
+            .anchor
+            .as_ref()
+            .is_some_and(|a| a.matches(anchor_tensor, ptr_addr, content_hash))
+        {
+            return;
+        }
+    }
+    let next = make_anchor_with_raw(anchor_tensor, ptr_addr, content_hash);
     let mut guard = fallback_cache()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if guard.anchor.as_ref() != Some(&next) {
         guard.matrices.clear();
         guard.vectors_1d.clear();
+        guard.model_meta = None;
+        guard.layer_biases.clear();
         guard.anchor = Some(next);
     }
 }
@@ -2284,6 +2706,76 @@ pub fn clear_repack_cache() {
     guard.anchor = None;
     guard.matrices.clear();
     guard.vectors_1d.clear();
+    guard.model_meta = None;
+    guard.layer_biases.clear();
+}
+
+pub(crate) fn lookup_fallback_geometry(
+    anchor_tensor: &TensorView<'_>,
+    architecture: &'static str,
+    rotary_dim_cfg: Option<usize>,
+    logits_len: usize,
+) -> Option<(CachedFallbackGeometry, (usize, u64))> {
+    let raw = anchor_tensor.as_bytes();
+    let ptr_addr = raw.as_ptr() as usize;
+    let content_hash = hash_bytes_sample(raw);
+    let guard = fallback_cache()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !guard
+        .anchor
+        .as_ref()
+        .is_some_and(|a| a.matches(anchor_tensor, ptr_addr, content_hash))
+    {
+        return None;
+    }
+    guard
+        .model_meta
+        .filter(|meta| {
+            meta.architecture == architecture
+                && meta.rotary_dim_cfg == rotary_dim_cfg
+                && meta.logits_len == logits_len
+        })
+        .map(|meta| (meta, (ptr_addr, content_hash)))
+}
+
+pub(crate) fn lookup_fallback_layer_biases(
+    anchor_token: (usize, u64),
+    layer: usize,
+) -> Option<CachedLayerBiasFlags> {
+    let guard = fallback_cache()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !guard
+        .anchor
+        .as_ref()
+        .is_some_and(|a| a.ptr_addr == anchor_token.0 && a.content_hash == anchor_token.1)
+    {
+        return None;
+    }
+    guard.layer_biases.get(layer).copied()
+}
+
+pub(crate) fn store_fallback_geometry(
+    anchor_tensor: &TensorView<'_>,
+    meta: CachedFallbackGeometry,
+    layer_biases: Vec<CachedLayerBiasFlags>,
+) -> (usize, u64) {
+    let raw = anchor_tensor.as_bytes();
+    let ptr_addr = raw.as_ptr() as usize;
+    let content_hash = hash_bytes_sample(raw);
+    let mut guard = fallback_cache()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard
+        .anchor
+        .as_ref()
+        .is_some_and(|a| a.matches(anchor_tensor, ptr_addr, content_hash))
+    {
+        guard.model_meta = Some(meta);
+        guard.layer_biases = layer_biases;
+    }
+    (ptr_addr, content_hash)
 }
 
 /// Returns the number of cached 2D weight matrices in the active-model fallback cache.
@@ -2316,12 +2808,17 @@ pub fn get_or_repack(
     rows: usize,
     cols: usize,
 ) -> Result<Arc<CachedMatrix>, K3Error> {
-    let key = make_cache_key(tensor);
+    let raw = tensor.as_bytes();
+    let ptr_addr = raw.as_ptr() as usize;
+    let content_hash = hash_bytes_sample(raw);
+    let lookup_hash = hash_cache_lookup(tensor, ptr_addr, content_hash);
     {
         let guard = fallback_cache()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hit) = guard.matrices.get(&key)
+        if let Some(hit) = guard
+            .matrices
+            .get_borrowed(lookup_hash, tensor, ptr_addr, content_hash)
             && hit.rows() == rows
             && hit.cols() == cols
         {
@@ -2333,10 +2830,13 @@ pub fn get_or_repack(
     let mut guard = fallback_cache()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = guard
-        .matrices
-        .entry(key)
-        .or_insert_with(|| Arc::clone(&repacked));
+    let entry = guard.matrices.get_or_insert_with_tensor(
+        lookup_hash,
+        tensor,
+        ptr_addr,
+        content_hash,
+        repacked,
+    );
     Ok(Arc::clone(entry))
 }
 
@@ -2351,12 +2851,18 @@ pub fn get_or_decode_1d_f32(
     expected_len: usize,
     sanitize_large: bool,
 ) -> Result<Arc<Aligned128F32>, K3Error> {
-    let key = make_cache_key(tensor);
+    let raw = tensor.as_bytes();
+    let ptr_addr = raw.as_ptr() as usize;
+    let content_hash = hash_bytes_sample(raw);
+    let lookup_hash = hash_cache_lookup(tensor, ptr_addr, content_hash);
     {
         let guard = fallback_cache()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(hit) = guard.vectors_1d.get(&key)
+        if let Some(hit) =
+            guard
+                .vectors_1d
+                .get_borrowed(lookup_hash, tensor, ptr_addr, content_hash)
             && hit.len() == expected_len
         {
             return Ok(Arc::clone(hit));
@@ -2371,10 +2877,13 @@ pub fn get_or_decode_1d_f32(
     let mut guard = fallback_cache()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = guard
-        .vectors_1d
-        .entry(key)
-        .or_insert_with(|| Arc::clone(&decoded));
+    let entry = guard.vectors_1d.get_or_insert_with_tensor(
+        lookup_hash,
+        tensor,
+        ptr_addr,
+        content_hash,
+        decoded,
+    );
     Ok(Arc::clone(entry))
 }
 
@@ -2386,12 +2895,19 @@ mod tests {
     use super::*;
 
     fn set_anchor_on(cache: &mut ActiveModelFallbackCache, anchor_tensor: &TensorView<'_>) {
-        let next = make_anchor(anchor_tensor);
-        if cache.anchor.as_ref() != Some(&next) {
-            cache.matrices.clear();
-            cache.vectors_1d.clear();
-            cache.anchor = Some(next);
+        let raw = anchor_tensor.as_bytes();
+        let ptr_addr = raw.as_ptr() as usize;
+        let content_hash = hash_bytes_sample(raw);
+        if cache
+            .anchor
+            .as_ref()
+            .is_some_and(|a| a.matches(anchor_tensor, ptr_addr, content_hash))
+        {
+            return;
         }
+        cache.matrices.clear();
+        cache.vectors_1d.clear();
+        cache.anchor = Some(make_anchor_with_raw(anchor_tensor, ptr_addr, content_hash));
     }
 
     fn get_or_repack_on(
@@ -2400,18 +2916,26 @@ mod tests {
         rows: usize,
         cols: usize,
     ) -> Result<Arc<CachedMatrix>, K3Error> {
-        let key = make_cache_key(tensor);
-        if let Some(hit) = cache.matrices.get(&key)
+        let raw = tensor.as_bytes();
+        let ptr_addr = raw.as_ptr() as usize;
+        let content_hash = hash_bytes_sample(raw);
+        let lookup_hash = hash_cache_lookup(tensor, ptr_addr, content_hash);
+        if let Some(hit) = cache
+            .matrices
+            .get_borrowed(lookup_hash, tensor, ptr_addr, content_hash)
             && hit.rows() == rows
             && hit.cols() == cols
         {
             return Ok(Arc::clone(hit));
         }
         let repacked = Arc::new(CachedMatrix::repack(tensor, rows, cols)?);
-        let entry = cache
-            .matrices
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&repacked));
+        let entry = cache.matrices.get_or_insert_with_tensor(
+            lookup_hash,
+            tensor,
+            ptr_addr,
+            content_hash,
+            repacked,
+        );
         Ok(Arc::clone(entry))
     }
 
@@ -2421,8 +2945,14 @@ mod tests {
         expected_len: usize,
         sanitize_large: bool,
     ) -> Result<Arc<Aligned128F32>, K3Error> {
-        let key = make_cache_key(tensor);
-        if let Some(hit) = cache.vectors_1d.get(&key)
+        let raw = tensor.as_bytes();
+        let ptr_addr = raw.as_ptr() as usize;
+        let content_hash = hash_bytes_sample(raw);
+        let lookup_hash = hash_cache_lookup(tensor, ptr_addr, content_hash);
+        if let Some(hit) =
+            cache
+                .vectors_1d
+                .get_borrowed(lookup_hash, tensor, ptr_addr, content_hash)
             && hit.len() == expected_len
         {
             return Ok(Arc::clone(hit));
@@ -2432,10 +2962,13 @@ mod tests {
             expected_len,
             sanitize_large,
         )?);
-        let entry = cache
-            .vectors_1d
-            .entry(key)
-            .or_insert_with(|| Arc::clone(&decoded));
+        let entry = cache.vectors_1d.get_or_insert_with_tensor(
+            lookup_hash,
+            tensor,
+            ptr_addr,
+            content_hash,
+            decoded,
+        );
         Ok(Arc::clone(entry))
     }
 

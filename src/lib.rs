@@ -6,20 +6,29 @@
 //! frequency-scaled `RoPE` on both `Q` and `K`, `128-byte`-aligned cached weight repacking,
 //! batched multi-token `prefill_step` GEMMs, and row-parallel multi-threaded projections.
 
+pub mod decode_gemv;
 pub mod dispatch;
 pub mod recipe;
 pub mod repack_cache;
 
+pub use decode_gemv::{
+    BlockQ8_0, BlockQ8K, DecodeQ8Scratch, LayerKeyTable, LayerTensorKeys, bytes_as_q8_0_blocks_mut,
+    bytes_as_q8_k_blocks_mut, ensure_global_layer_keys, gemv_decode_projection,
+    gemv_decode_projection_with_workers, gemv_q4_0_q8_0, gemv_q4_k_q8_k, gemv_q5_0_q8_0,
+    gemv_q5_k_q8_k, gemv_q6_k_q8_k, gemv_q8_0_q8_0, gemv_tq1_0_q8_k, gemv_tq2_0_q8_k,
+    probe_live_layer_count, quantize_row_q8_0, quantize_row_q8_k,
+};
+
 pub use dispatch::{Lane, PhaseLayout, compute_row_dot, project_lm_head_row_split};
 pub use recipe::{LlamaRecipe, RopeScalingConfig, RopeType};
 pub use repack_cache::{
-    Aligned128, Aligned128F32, CachedMatrix, LayerRepackCache, LmHeadCache, MAX_DENSE_F32_ELEMENTS,
-    MAX_DENSE_HALF_ELEMENTS, ModelRepackCache, PANEL_ROWS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS,
-    Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS,
-    QuantizedBatchAct, cached_matrix_count, cached_vector_1d_count, clear_repack_cache,
-    decode_1d_f32, dequantize_q4_0_block, dequantize_q5_0_block, dequantize_q5_k_block,
-    get_or_decode_1d_f32, get_or_repack, is_oversized_dense, par_for_each_row_tile,
-    thread_decode_1d_count,
+    Aligned128, Aligned128F32, CachedMatrix, DecodeActQ8View, LayerRepackCache, LmHeadCache,
+    MAX_DENSE_F32_ELEMENTS, MAX_DENSE_HALF_ELEMENTS, ModelRepackCache, PANEL_ROWS,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES,
+    Q5_K_BLOCK_ELEMENTS, QuantizedBatchAct, cached_matrix_count, cached_vector_1d_count,
+    clear_repack_cache, decode_1d_f32, dequantize_q4_0_block, dequantize_q5_0_block,
+    dequantize_q5_k_block, get_or_decode_1d_f32, get_or_repack, is_oversized_dense,
+    par_for_each_row_tile, thread_decode_1d_count,
 };
 
 #[cfg(test)]
@@ -949,5 +958,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_wave4_decode_step_with_explicit_scratch_workspace_and_fail_closed_miri_safe() {
+        let mut raw = build_compact_arch_gguf("llama", None, &[]);
+        let parsed = GgufFile::parse(&raw).unwrap();
+        let descs = parsed.metadata().tensors().to_vec();
+        for (idx, desc) in descs.iter().enumerate() {
+            let start = desc.absolute_offset();
+            let elems = desc.num_elements();
+            for e in 0..elems {
+                #[expect(clippy::cast_precision_loss, reason = "small bounded pattern")]
+                let val = (((e * 5 + idx * 3) % 13) as f32 - 6.0) * 0.03;
+                raw[start + e * 4..start + e * 4 + 4].copy_from_slice(&val.to_le_bytes());
+            }
+        }
+        let gguf = GgufFile::parse(&raw).unwrap();
+        let recipe = LlamaRecipe::from_gguf(&gguf).unwrap();
+        let cache = recipe.build_repack_cache(&gguf).unwrap();
+        let kv_geom = KvGeometry::new(1, 1, 8, 8, None).unwrap();
+        let kv_len = kv_geom.required_f32_len().unwrap();
+
+        let scratch_bytes = recipe.decode_scratch_bytes(8);
+        assert!(scratch_bytes > 0);
+        let mut scratch = jero_core::ScratchWorkspace::new(scratch_bytes).unwrap();
+
+        let mut logits_ws = vec![0.0_f32; 12];
+        let mut kv_ws = vec![0.0_f32; kv_len];
+        let mut ctx_ws = ExecutionContext::new(&[1, 2], 8, &mut logits_ws, &mut kv_ws)
+            .unwrap()
+            .with_kv_geometry(kv_geom)
+            .unwrap()
+            .with_scratch(&mut scratch);
+        recipe
+            .prefill_step_with_cache(&mut ctx_ws, &gguf, &cache)
+            .unwrap();
+        ctx_ws.prepare_decode(4).unwrap();
+        recipe
+            .decode_step_with_cache(&mut ctx_ws, &gguf, &cache)
+            .unwrap();
+        assert_eq!(ctx_ws.position(), 3);
+        assert!(ctx_ws.scratch().unwrap().peak_used_bytes() <= scratch_bytes);
+        assert_eq!(ctx_ws.scratch().unwrap().used_bytes(), 0);
+
+        let mut logits_fb = vec![0.0_f32; 12];
+        let mut kv_fb = vec![0.0_f32; kv_len];
+        let mut ctx_fb = ExecutionContext::new(&[1, 2], 8, &mut logits_fb, &mut kv_fb)
+            .unwrap()
+            .with_kv_geometry(kv_geom)
+            .unwrap();
+        recipe.prefill_step(&mut ctx_fb, &gguf).unwrap();
+        ctx_fb.prepare_decode(4).unwrap();
+        recipe.decode_step(&mut ctx_fb, &gguf).unwrap();
+
+        for (i, (&a, &b)) in logits_ws.iter().zip(&logits_fb).enumerate() {
+            assert!(
+                a.is_finite() && (a - b).abs() < 1.0e-5,
+                "explicit ScratchWorkspace decode logit {i}: {a} vs {b}"
+            );
+        }
+
+        // Undersized ScratchWorkspace fails closed without advancing position
+        let mut tiny = jero_core::ScratchWorkspace::new(128).unwrap();
+        let mut tiny_ctx = ExecutionContext::new(&[], 8, &mut logits_fb, &mut kv_fb)
+            .unwrap()
+            .with_kv_geometry(kv_geom)
+            .unwrap()
+            .with_scratch(&mut tiny);
+        tiny_ctx.prepare_decode(4).unwrap();
+        let before_pos = tiny_ctx.position();
+        let err = recipe
+            .decode_step(&mut tiny_ctx, &gguf)
+            .expect_err("undersized ScratchWorkspace must fail closed");
+        assert!(matches!(err, K3Error::TensorBoundsError { .. }));
+        assert_eq!(tiny_ctx.position(), before_pos);
     }
 }

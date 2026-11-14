@@ -17,9 +17,7 @@ use crate::repack_cache::{
     bf16_to_f32_finite, dequantize_q4_k_m_block, dequantize_q5_k_block, dequantize_q6_k_block,
     dequantize_q8_0_block, f16_to_f32_finite,
 };
-use crate::repack_cache::{
-    dequantize_q4_0_block, dequantize_q5_0_block, get_or_repack, sanitize_f32_weight,
-};
+use crate::repack_cache::{dequantize_q4_0_block, dequantize_q5_0_block, sanitize_f32_weight};
 
 /// Hardware execution cluster lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,8 +229,38 @@ pub fn project_lm_head_row_split(
 
     let parallel = !layout.matmul.is_empty();
     let quant = output_weight.quant();
+    if crate::repack_cache::quant_block_geometry(quant).is_none() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "llama".to_owned(),
+            reason: format!(
+                "LM head tensor {} uses unsupported quantization {quant:?}",
+                output_weight.name()
+            ),
+        });
+    }
     if crate::repack_cache::is_oversized_dense(quant, rows, cols) {
         let raw = output_weight.as_bytes();
+        let stride_bytes = match quant {
+            QuantType::F32 => cols * 4,
+            QuantType::F16 | QuantType::BF16 => cols * 2,
+            _ => 0,
+        };
+        if stride_bytes > 0 {
+            crate::repack_cache::par_for_each_row_tile(
+                logits,
+                crate::repack_cache::PANEL_ROWS,
+                parallel,
+                |panel_idx, slice| {
+                    let row_start = panel_idx * crate::repack_cache::PANEL_ROWS;
+                    for (local_r, slot) in slice.iter_mut().enumerate() {
+                        let row_raw = &raw[(row_start + local_r) * stride_bytes..][..stride_bytes];
+                        *slot =
+                            crate::decode_gemv::dot_dense_row_zero_alloc(quant, row_raw, hidden);
+                    }
+                },
+            );
+            return Ok(());
+        }
         crate::repack_cache::par_for_each_row_tile(
             logits,
             crate::repack_cache::PANEL_ROWS,
@@ -247,8 +275,17 @@ pub fn project_lm_head_row_split(
         return Ok(());
     }
 
-    let cached = get_or_repack(output_weight, rows, cols)?;
-    cached.gemv_rows(logits, hidden, parallel)
+    let workers = if parallel && !cfg!(miri) {
+        rayon::current_num_threads().max(1)
+    } else {
+        1
+    };
+    crate::decode_gemv::gemv_decode_projection_with_thread_scratch(
+        logits,
+        output_weight,
+        hidden,
+        workers,
+    )
 }
 
 #[cfg(test)]
