@@ -23,6 +23,8 @@ use jero_kernels_rvv::{
     Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, VectorKernel, bf16_to_f32_finite,
     dequantize_q4_k_m_block, dequantize_q6_k_block, dequantize_q8_0_block, f16_to_f32_finite,
 };
+#[cfg(feature = "with-kernels")]
+pub use jero_kernels_rvv::{Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, dequantize_q5_k_block};
 
 #[cfg(not(feature = "with-kernels"))]
 const TILE_M: usize = 8;
@@ -36,6 +38,12 @@ const TILE_BYTES: usize = 128;
 const Q4_K_M_BLOCK_ELEMENTS: usize = 256;
 #[cfg(not(feature = "with-kernels"))]
 const Q4_K_M_BLOCK_BYTES: usize = 144;
+/// Number of scalar elements per `Q5_K` super-block.
+#[cfg(not(feature = "with-kernels"))]
+pub const Q5_K_BLOCK_ELEMENTS: usize = 256;
+/// Storage size in bytes of a single `Q5_K` super-block.
+#[cfg(not(feature = "with-kernels"))]
+pub const Q5_K_BLOCK_BYTES: usize = 176;
 #[cfg(not(feature = "with-kernels"))]
 const Q8_0_BLOCK_ELEMENTS: usize = 32;
 #[cfg(not(feature = "with-kernels"))]
@@ -50,6 +58,12 @@ pub const Q4_0_BLOCK_ELEMENTS: usize = 32;
 
 /// Storage size in bytes of a single `Q4_0` block (2B `f16` scale + 16B nibbles).
 pub const Q4_0_BLOCK_BYTES: usize = 18;
+
+/// Number of scalar elements per `Q5_0` block.
+pub const Q5_0_BLOCK_ELEMENTS: usize = 32;
+
+/// Storage size in bytes of a single `Q5_0` block (2B `f16` scale + 4B high bits + 16B nibbles).
+pub const Q5_0_BLOCK_BYTES: usize = 22;
 
 /// Number of output rows per parallel row-panel (`8 x TILE_N = 64` rows).
 pub const PANEL_ROWS: usize = 64;
@@ -237,6 +251,34 @@ pub fn dequantize_q4_0_block(block: &[u8; Q4_0_BLOCK_BYTES], out: &mut [f32; Q4_
     }
 }
 
+/// Dequantizes a single 22-byte `Q5_0` block (2B `f16` scale + 4B high bits + 16B packed nibbles)
+/// into 32 `f32`s matching GGML `dequantize_row_q5_0`.
+pub fn dequantize_q5_0_block(block: &[u8; Q5_0_BLOCK_BYTES], out: &mut [f32; Q5_0_BLOCK_ELEMENTS]) {
+    let d = f16_to_f32_finite(u16::from_le_bytes([block[0], block[1]]));
+    if d == 0.0 {
+        out.fill(0.0);
+        return;
+    }
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let qs = &block[6..22];
+    for (j, &packed) in qs.iter().enumerate() {
+        let xh_0 = ((qh >> j) & 1) << 4;
+        let xh_1 = ((qh >> (j + 16)) & 1) << 4;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "5-bit unsigned quant 0..=31 fits in i8 (-16..=15 after offset)"
+        )]
+        let q0 = ((u32::from(packed & 0x0F) | xh_0) as i8) - 16;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "5-bit unsigned quant 0..=31 fits in i8 (-16..=15 after offset)"
+        )]
+        let q1 = ((u32::from(packed >> 4) | xh_1) as i8) - 16;
+        out[j] = d * f32::from(q0);
+        out[j + 16] = d * f32::from(q1);
+    }
+}
+
 #[cfg(not(feature = "with-kernels"))]
 pub(crate) fn dequantize_q8_0_block(
     block: &[u8; Q8_0_BLOCK_BYTES],
@@ -327,6 +369,41 @@ pub(crate) fn dequantize_q4_k_m_block(
     }
 }
 
+/// Dequantizes a 176-byte `Q5_K` super-block into 256 `f32`s matching GGML `dequantize_row_q5_K`.
+#[cfg(not(feature = "with-kernels"))]
+pub fn dequantize_q5_k_block(block: &[u8; Q5_K_BLOCK_BYTES], out: &mut [f32; Q5_K_BLOCK_ELEMENTS]) {
+    let d = f16_to_f32_finite(u16::from_le_bytes([block[0], block[1]]));
+    let dmin = f16_to_f32_finite(u16::from_le_bytes([block[2], block[3]]));
+    if d == 0.0 && dmin == 0.0 {
+        out.fill(0.0);
+        return;
+    }
+    let (sc, m) = unpack_q4_k_scales(&block[4..16]);
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+    let mut u1 = 1_u8;
+    let mut u2 = 2_u8;
+    for chunk in 0..4 {
+        let is = chunk * 2;
+        let d1 = d * f32::from(sc[is]);
+        let m1 = dmin * f32::from(m[is]);
+        let d2 = d * f32::from(sc[is + 1]);
+        let m2 = dmin * f32::from(m[is + 1]);
+        let out_idx = chunk * 64;
+        let q_offset = chunk * 32;
+        for l in 0..32 {
+            let hb1 = if (qh[l] & u1) != 0 { 16_u8 } else { 0_u8 };
+            let hb2 = if (qh[l] & u2) != 0 { 16_u8 } else { 0_u8 };
+            let q1 = (qs[q_offset + l] & 0x0F) + hb1;
+            let q2 = (qs[q_offset + l] >> 4) + hb2;
+            out[out_idx + l] = d1 * f32::from(q1) - m1;
+            out[out_idx + 32 + l] = d2 * f32::from(q2) - m2;
+        }
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
 /// Unpacks the 12-byte 6-bit scale and min table of a `Q4_K_M` super-block.
 #[must_use]
 #[inline]
@@ -352,9 +429,20 @@ pub const fn quant_block_geometry(quant: QuantType) -> Option<(usize, usize)> {
         QuantType::F16 | QuantType::BF16 => Some((1, 2)),
         QuantType::Q8_0 => Some((Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES)),
         QuantType::Q4_0 => Some((Q4_0_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES)),
+        QuantType::Q5_0 => Some((Q5_0_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES)),
         QuantType::Q4_K_M => Some((Q4_K_M_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES)),
+        QuantType::Q5_K => Some((Q5_K_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES)),
         QuantType::Q6_K => Some((Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES)),
-        QuantType::Q5_K | QuantType::TQ1_0 | QuantType::TQ2_0 => None,
+        QuantType::Q4_1
+        | QuantType::Q5_1
+        | QuantType::Q8_1
+        | QuantType::Q2_K
+        | QuantType::Q3_K
+        | QuantType::IQ4_NL
+        | QuantType::TQ1_0
+        | QuantType::TQ2_0
+        | QuantType::I2_S
+        | QuantType::MXFP4 => None,
     }
 }
 
@@ -504,6 +592,20 @@ pub fn decode_row_to_f32(
     decode_row_payload_to_f32(quant, row_raw, out)
 }
 
+fn decode_blocks_to_f32<const N: usize, const B: usize>(
+    row_raw: &[u8],
+    out: &mut [f32],
+    dequant: fn(&[u8; B], &mut [f32; N]),
+) {
+    let mut buf = [0.0_f32; N];
+    for (b_idx, chunk) in row_raw.chunks_exact(B).enumerate() {
+        if let Ok(block) = <&[u8; B]>::try_from(chunk) {
+            dequant(block, &mut buf);
+            out[b_idx * N..(b_idx + 1) * N].copy_from_slice(&buf);
+        }
+    }
+}
+
 fn decode_row_payload_to_f32(
     quant: QuantType,
     row_raw: &[u8],
@@ -528,43 +630,24 @@ fn decode_row_payload_to_f32(
                 *slot = bf16_to_f32_finite(u16::from_le_bytes([b[0], b[1]]));
             }
         }
-        QuantType::Q8_0 => {
-            let mut buf = [0.0_f32; Q8_0_BLOCK_ELEMENTS];
-            for (b_idx, chunk) in row_raw.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
-                if let Ok(block) = <&[u8; Q8_0_BLOCK_BYTES]>::try_from(chunk) {
-                    dequantize_q8_0_block(block, &mut buf);
-                    out[b_idx * 32..(b_idx + 1) * 32].copy_from_slice(&buf);
-                }
-            }
-        }
-        QuantType::Q4_0 => {
-            let mut buf = [0.0_f32; Q4_0_BLOCK_ELEMENTS];
-            for (b_idx, chunk) in row_raw.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
-                if let Ok(block) = <&[u8; Q4_0_BLOCK_BYTES]>::try_from(chunk) {
-                    dequantize_q4_0_block(block, &mut buf);
-                    out[b_idx * 32..(b_idx + 1) * 32].copy_from_slice(&buf);
-                }
-            }
-        }
+        QuantType::Q8_0 => decode_blocks_to_f32::<32, 34>(row_raw, out, dequantize_q8_0_block),
+        QuantType::Q4_0 => decode_blocks_to_f32::<32, 18>(row_raw, out, dequantize_q4_0_block),
+        QuantType::Q5_0 => decode_blocks_to_f32::<32, 22>(row_raw, out, dequantize_q5_0_block),
         QuantType::Q4_K_M => {
-            let mut buf = [0.0_f32; Q4_K_M_BLOCK_ELEMENTS];
-            for (b_idx, chunk) in row_raw.chunks_exact(Q4_K_M_BLOCK_BYTES).enumerate() {
-                if let Ok(block) = <&[u8; Q4_K_M_BLOCK_BYTES]>::try_from(chunk) {
-                    dequantize_q4_k_m_block(block, &mut buf);
-                    out[b_idx * 256..(b_idx + 1) * 256].copy_from_slice(&buf);
-                }
-            }
+            decode_blocks_to_f32::<256, 144>(row_raw, out, dequantize_q4_k_m_block);
         }
-        QuantType::Q6_K => {
-            let mut buf = [0.0_f32; Q6_K_BLOCK_ELEMENTS];
-            for (b_idx, chunk) in row_raw.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
-                if let Ok(block) = <&[u8; Q6_K_BLOCK_BYTES]>::try_from(chunk) {
-                    dequantize_q6_k_block(block, &mut buf);
-                    out[b_idx * 256..(b_idx + 1) * 256].copy_from_slice(&buf);
-                }
-            }
-        }
-        QuantType::Q5_K | QuantType::TQ1_0 | QuantType::TQ2_0 => {
+        QuantType::Q5_K => decode_blocks_to_f32::<256, 176>(row_raw, out, dequantize_q5_k_block),
+        QuantType::Q6_K => decode_blocks_to_f32::<256, 210>(row_raw, out, dequantize_q6_k_block),
+        QuantType::Q4_1
+        | QuantType::Q5_1
+        | QuantType::Q8_1
+        | QuantType::Q2_K
+        | QuantType::Q3_K
+        | QuantType::IQ4_NL
+        | QuantType::TQ1_0
+        | QuantType::TQ2_0
+        | QuantType::I2_S
+        | QuantType::MXFP4 => {
             return Err(K3Error::CapabilityMismatch {
                 architecture: "llama".to_owned(),
                 reason: format!("unsupported quant {quant:?}"),
@@ -811,7 +894,12 @@ impl CachedMatrix {
         }
 
         match quant {
-            QuantType::Q8_0 | QuantType::Q4_0 | QuantType::Q4_K_M | QuantType::Q6_K => {
+            QuantType::Q8_0
+            | QuantType::Q4_0
+            | QuantType::Q5_0
+            | QuantType::Q4_K_M
+            | QuantType::Q5_K
+            | QuantType::Q6_K => {
                 Self::repack_block_scaled_i8(&raw[..required_bytes], rows, cols, row_bytes, quant)
             }
             QuantType::F32 | QuantType::F16 | QuantType::BF16 => Ok(Self::repack_dense(
@@ -820,12 +908,19 @@ impl CachedMatrix {
                 cols,
                 quant,
             )),
-            QuantType::Q5_K | QuantType::TQ1_0 | QuantType::TQ2_0 => {
-                Err(K3Error::CapabilityMismatch {
-                    architecture: "llama".to_owned(),
-                    reason: format!("unsupported quant {quant:?} in Llama/Qwen2 repack cache"),
-                })
-            }
+            QuantType::Q4_1
+            | QuantType::Q5_1
+            | QuantType::Q8_1
+            | QuantType::Q2_K
+            | QuantType::Q3_K
+            | QuantType::IQ4_NL
+            | QuantType::TQ1_0
+            | QuantType::TQ2_0
+            | QuantType::I2_S
+            | QuantType::MXFP4 => Err(K3Error::CapabilityMismatch {
+                architecture: "llama".to_owned(),
+                reason: format!("unsupported quant {quant:?} in Llama/Qwen2 repack cache"),
+            }),
         }
     }
 
@@ -942,8 +1037,8 @@ impl CachedMatrix {
         quant: QuantType,
     ) -> Result<Self, K3Error> {
         let (group_size, has_mins) = match quant {
-            QuantType::Q8_0 | QuantType::Q4_0 => (32, false),
-            QuantType::Q4_K_M => (32, true),
+            QuantType::Q8_0 | QuantType::Q4_0 | QuantType::Q5_0 => (32, false),
+            QuantType::Q4_K_M | QuantType::Q5_K => (32, true),
             QuantType::Q6_K => (16, false),
             _ => {
                 return Err(K3Error::CapabilityMismatch {
@@ -1342,6 +1437,114 @@ fn compute_streaming_dense_panel(
     }
 }
 
+fn write_k_superblock_scales(
+    sb_idx: usize,
+    d: f32,
+    dmin: f32,
+    blk_scales: &[u8],
+    out_scales: &mut [f32],
+    out_mins: &mut [f32],
+) {
+    let (sc, m) = unpack_q4_k_scales(blk_scales);
+    let base = sb_idx * 8;
+    for sub in 0..8 {
+        out_scales[base + sub] = d * f32::from(sc[sub]);
+        out_mins[base + sub] = dmin * f32::from(m[sub]);
+    }
+}
+
+fn unpack_q4_k_q5_k_row_i8(
+    row_raw: &[u8],
+    is_q5_k: bool,
+    out_q: &mut [i8],
+    out_scales: &mut [f32],
+    out_mins: &mut [f32],
+) {
+    let blk_bytes = if is_q5_k {
+        Q5_K_BLOCK_BYTES
+    } else {
+        Q4_K_M_BLOCK_BYTES
+    };
+    for (sb_idx, blk) in row_raw.chunks_exact(blk_bytes).enumerate() {
+        let d = f16_to_f32_finite(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = f16_to_f32_finite(u16::from_le_bytes([blk[2], blk[3]]));
+        write_k_superblock_scales(sb_idx, d, dmin, &blk[4..16], out_scales, out_mins);
+        let qs = if is_q5_k {
+            &blk[48..176]
+        } else {
+            &blk[16..144]
+        };
+        let qh = is_q5_k.then(|| &blk[16..48]);
+        let mut u1 = 1_u8;
+        let mut u2 = 2_u8;
+        for chunk in 0..4 {
+            let q_off = chunk * 32;
+            let dst_off = sb_idx * 256 + chunk * 64;
+            for l in 0..32 {
+                let (hb1, hb2) = qh.map_or((0_u8, 0_u8), |qh_slice| {
+                    (
+                        if (qh_slice[l] & u1) != 0 { 16 } else { 0 },
+                        if (qh_slice[l] & u2) != 0 { 16 } else { 0 },
+                    )
+                });
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "unsigned 4/5-bit quant 0..=31 fits in positive i8"
+                )]
+                {
+                    out_q[dst_off + l] = ((qs[q_off + l] & 0x0F) + hb1) as i8;
+                    out_q[dst_off + 32 + l] = ((qs[q_off + l] >> 4) + hb2) as i8;
+                }
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+fn unpack_q6_k_row_i8(row_raw: &[u8], out_q: &mut [i8], out_scales: &mut [f32]) {
+    for (sb_idx, blk) in row_raw.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+        let d = f16_to_f32_finite(u16::from_le_bytes([blk[208], blk[209]]));
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let scales = &blk[192..208];
+        for sub in 0..16 {
+            #[expect(clippy::cast_possible_wrap, reason = "signed i8 sub-block scale")]
+            {
+                out_scales[sb_idx * 16 + sub] = d * f32::from(scales[sub] as i8);
+            }
+        }
+        let dst_base = sb_idx * 256;
+        for (half_idx, &n) in [0_usize, 128_usize].iter().enumerate() {
+            let low_base = half_idx * 64;
+            let high_base = half_idx * 32;
+            for l in 0..32 {
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "6-bit unsigned quant 0..63 offset by -32 fits in i8"
+                )]
+                {
+                    out_q[dst_base + n + l] =
+                        (((ql[low_base + l] & 0x0F) | ((qh[high_base + l] & 0x03) << 4)) as i8)
+                            - 32;
+                    out_q[dst_base + n + l + 32] = (((ql[low_base + l + 32] & 0x0F)
+                        | (((qh[high_base + l] >> 2) & 0x03) << 4))
+                        as i8)
+                        - 32;
+                    out_q[dst_base + n + l + 64] = ((((ql[low_base + l] >> 4) & 0x0F)
+                        | (((qh[high_base + l] >> 4) & 0x03) << 4))
+                        as i8)
+                        - 32;
+                    out_q[dst_base + n + l + 96] = ((((ql[low_base + l + 32] >> 4) & 0x0F)
+                        | (((qh[high_base + l] >> 6) & 0x03) << 4))
+                        as i8)
+                        - 32;
+                }
+            }
+        }
+    }
+}
+
 fn unpack_quant_row_i8(
     row_raw: &[u8],
     quant: QuantType,
@@ -1374,77 +1577,28 @@ fn unpack_quant_row_i8(
                 }
             }
         }
-        QuantType::Q4_K_M => {
-            for (sb_idx, blk) in row_raw.chunks_exact(Q4_K_M_BLOCK_BYTES).enumerate() {
-                let d = f16_to_f32_finite(u16::from_le_bytes([blk[0], blk[1]]));
-                let dmin = f16_to_f32_finite(u16::from_le_bytes([blk[2], blk[3]]));
-                let (sc, m) = unpack_q4_k_scales(&blk[4..16]);
-                let qs = &blk[16..144];
-                for chunk in 0..4 {
-                    let sub0 = sb_idx * 8 + chunk * 2;
-                    let sub1 = sub0 + 1;
-                    out_scales[sub0] = d * f32::from(sc[chunk * 2]);
-                    out_mins[sub0] = dmin * f32::from(m[chunk * 2]);
-                    out_scales[sub1] = d * f32::from(sc[chunk * 2 + 1]);
-                    out_mins[sub1] = dmin * f32::from(m[chunk * 2 + 1]);
-                    let q_off = chunk * 32;
-                    let dst_off = sb_idx * 256 + chunk * 64;
-                    for l in 0..32 {
-                        #[expect(
-                            clippy::cast_possible_wrap,
-                            reason = "unsigned 4-bit nibble 0..=15 fits in positive i8"
-                        )]
-                        {
-                            out_q[dst_off + l] = (qs[q_off + l] & 0x0F) as i8;
-                            out_q[dst_off + 32 + l] = ((qs[q_off + l] >> 4) & 0x0F) as i8;
-                        }
-                    }
-                }
-            }
-        }
-        QuantType::Q6_K => {
-            for (sb_idx, blk) in row_raw.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
-                let d = f16_to_f32_finite(u16::from_le_bytes([blk[208], blk[209]]));
-                let ql = &blk[0..128];
-                let qh = &blk[128..192];
-                let scales = &blk[192..208];
-                for sub in 0..16 {
-                    #[expect(clippy::cast_possible_wrap, reason = "signed i8 sub-block scale")]
+        QuantType::Q5_0 => {
+            for (g, blk) in row_raw.chunks_exact(Q5_0_BLOCK_BYTES).enumerate() {
+                out_scales[g] = f16_to_f32_finite(u16::from_le_bytes([blk[0], blk[1]]));
+                let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+                let qs = &blk[6..22];
+                for (j, &packed) in qs.iter().enumerate() {
+                    let xh_0 = ((qh >> j) & 1) << 4;
+                    let xh_1 = ((qh >> (j + 16)) & 1) << 4;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "5-bit unsigned quant 0..=31 fits in i8 (-16..=15 after offset)"
+                    )]
                     {
-                        out_scales[sb_idx * 16 + sub] = d * f32::from(scales[sub] as i8);
-                    }
-                }
-                let dst_base = sb_idx * 256;
-                for (half_idx, &n) in [0_usize, 128_usize].iter().enumerate() {
-                    let low_base = half_idx * 64;
-                    let high_base = half_idx * 32;
-                    for l in 0..32 {
-                        #[expect(
-                            clippy::cast_possible_wrap,
-                            reason = "6-bit unsigned quant 0..63 offset by -32 fits in i8"
-                        )]
-                        {
-                            out_q[dst_base + n + l] = (((ql[low_base + l] & 0x0F)
-                                | ((qh[high_base + l] & 0x03) << 4))
-                                as i8)
-                                - 32;
-                            out_q[dst_base + n + l + 32] = (((ql[low_base + l + 32] & 0x0F)
-                                | (((qh[high_base + l] >> 2) & 0x03) << 4))
-                                as i8)
-                                - 32;
-                            out_q[dst_base + n + l + 64] = ((((ql[low_base + l] >> 4) & 0x0F)
-                                | (((qh[high_base + l] >> 4) & 0x03) << 4))
-                                as i8)
-                                - 32;
-                            out_q[dst_base + n + l + 96] = ((((ql[low_base + l + 32] >> 4) & 0x0F)
-                                | (((qh[high_base + l] >> 6) & 0x03) << 4))
-                                as i8)
-                                - 32;
-                        }
+                        out_q[g * 32 + j] = ((u32::from(packed & 0x0F) | xh_0) as i8) - 16;
+                        out_q[g * 32 + 16 + j] = ((u32::from(packed >> 4) | xh_1) as i8) - 16;
                     }
                 }
             }
         }
+        QuantType::Q4_K_M => unpack_q4_k_q5_k_row_i8(row_raw, false, out_q, out_scales, out_mins),
+        QuantType::Q5_K => unpack_q4_k_q5_k_row_i8(row_raw, true, out_q, out_scales, out_mins),
+        QuantType::Q6_K => unpack_q6_k_row_i8(row_raw, out_q, out_scales),
         _ => unreachable!(),
     }
 }
