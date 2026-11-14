@@ -369,7 +369,7 @@ mod portable {
         }
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Default)]
     pub(super) struct QuantizedActQ8 {
         m: usize,
         k: usize,
@@ -380,7 +380,29 @@ mod portable {
     }
 
     impl QuantizedActQ8 {
+        pub(super) const fn new() -> Self {
+            Self {
+                m: 0,
+                k: 0,
+                blocks32_per_row: 0,
+                f32_rows: Vec::new(),
+                q8_32_rows: Vec::new(),
+                scales_32: Vec::new(),
+            }
+        }
+
         pub(super) fn quantize(act: &[f32], m: usize, k: usize) -> Result<Self, K3Error> {
+            let mut out = Self::new();
+            out.quantize_into(act, m, k)?;
+            Ok(out)
+        }
+
+        pub(super) fn quantize_into(
+            &mut self,
+            act: &[f32],
+            m: usize,
+            k: usize,
+        ) -> Result<(), K3Error> {
             if m == 0 || k == 0 || act.len() != m.saturating_mul(k) {
                 return Err(K3Error::TensorBoundsError {
                     tensor_name: "QuantizedActQ8".to_owned(),
@@ -392,14 +414,22 @@ mod portable {
             }
             let blocks32_per_row = k.div_ceil(32);
             let k_padded = blocks32_per_row * 32;
-            let mut f32_rows = vec![Aligned128::zeroed(); m * blocks32_per_row];
-            let mut q8_32_rows = vec![0_i8; m * k_padded];
-            let mut scales_32 = vec![0.0_f32; m * blocks32_per_row];
+            self.m = m;
+            self.k = k;
+            self.blocks32_per_row = blocks32_per_row;
+
+            self.f32_rows.clear();
+            self.f32_rows
+                .resize(m * blocks32_per_row, Aligned128::zeroed());
+            self.q8_32_rows.clear();
+            self.q8_32_rows.resize(m * k_padded, 0_i8);
+            self.scales_32.clear();
+            self.scales_32.resize(m * blocks32_per_row, 0.0_f32);
 
             for tok in 0..m {
                 let src = &act[tok * k..(tok + 1) * k];
                 let dst_f32 = Aligned128::slice_as_f32_mut(
-                    &mut f32_rows[tok * blocks32_per_row..(tok + 1) * blocks32_per_row],
+                    &mut self.f32_rows[tok * blocks32_per_row..(tok + 1) * blocks32_per_row],
                 );
                 for (dst, &v) in dst_f32.iter_mut().zip(src) {
                     *dst = if v.is_finite() { v } else { 0.0_f32 };
@@ -413,7 +443,7 @@ mod portable {
                     }
                     let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
                     let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-                    let dst_q = &mut q8_32_rows[tok * k_padded + c_start..];
+                    let dst_q = &mut self.q8_32_rows[tok * k_padded + c_start..];
                     for (idx, &v) in dst_f32[c_start..c_end].iter().enumerate() {
                         #[expect(
                             clippy::cast_possible_truncation,
@@ -423,17 +453,10 @@ mod portable {
                             dst_q[idx] = (v * inv).round().clamp(-127.0, 127.0) as i8;
                         }
                     }
-                    scales_32[tok * blocks32_per_row + b] = scale;
+                    self.scales_32[tok * blocks32_per_row + b] = scale;
                 }
             }
-            Ok(Self {
-                m,
-                k,
-                blocks32_per_row,
-                f32_rows,
-                q8_32_rows,
-                scales_32,
-            })
+            Ok(())
         }
 
         pub(super) const fn m(&self) -> usize {
@@ -1301,12 +1324,29 @@ pub fn decode_1d_f32(
 
 /// Pre-quantized `[M, K]` activation batch shared across multi-projection layers (`Q/K/V`, `gate/up`),
 /// delegating to `jero_kernels_rvv::repack::QuantizedActQ8` when `with-kernels` is enabled.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QuantizedBatchAct {
     inner: QuantizedActQ8,
 }
 
 impl QuantizedBatchAct {
+    /// Creates an empty reusable [`QuantizedBatchAct`] container for multi-layer prefill passes.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            inner: QuantizedActQ8::new(),
+        }
+    }
+
+    /// Quantizes `[m, cols]` activations into `self`, reusing preallocated Q8/F32 scratch storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] when `m == 0`, `cols == 0`, or `input.len() != m * cols`.
+    pub fn quantize_into(&mut self, input: &[f32], m: usize, cols: usize) -> Result<(), K3Error> {
+        self.inner.quantize_into(input, m, cols)
+    }
+
     /// Quantizes an `f32` activation batch `[m, cols]` once into `128-byte`-aligned Q8 tiles
     /// (plus sanitized `f32` rows for dense `F32`/`F16`/`BF16` projections).
     ///
@@ -1592,6 +1632,73 @@ impl CachedMatrix {
     }
 }
 
+const MAX_STACK_PANEL_ELEMS: usize = PANEL_ROWS * 32;
+
+thread_local! {
+    static GEMM_PANEL_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy)]
+struct SharedMutOutput {
+    ptr: *mut f32,
+    cols_stride: usize,
+    len: usize,
+}
+
+impl SharedMutOutput {
+    fn new(output: &mut [f32], rows: usize) -> Self {
+        Self {
+            ptr: output.as_mut_ptr(),
+            cols_stride: rows,
+            len: output.len(),
+        }
+    }
+}
+
+// SAFETY: `run_repacked_gemm_panels` and tests partition columns `0..rows` into strictly disjoint
+// ranges `[row_start..row_end)` across parallel workers, so no two threads ever access overlapping
+// `output[tok * cols_stride + row]` elements.
+unsafe impl Send for SharedMutOutput {}
+// SAFETY: Disjoint column ranges across `0..cols_stride` guarantee conflict-free concurrent writes.
+unsafe impl Sync for SharedMutOutput {}
+
+fn scatter_panel_to_output(
+    out: SharedMutOutput,
+    panel: &[f32],
+    m: usize,
+    row_start: usize,
+    sub_n: usize,
+) {
+    debug_assert_eq!(panel.len(), m * sub_n);
+    debug_assert!(row_start + sub_n <= out.cols_stride);
+    debug_assert_eq!(m * out.cols_stride, out.len);
+    for tok in 0..m {
+        let src = &panel[tok * sub_n..(tok + 1) * sub_n];
+        let dst_offset = tok * out.cols_stride + row_start;
+        debug_assert!(dst_offset + sub_n <= out.len);
+        // SAFETY: Caller assigned each worker a strictly disjoint column range
+        // `[row_start..row_start + sub_n)`, `dst_offset + sub_n <= out.len`, and `panel` lives in
+        // caller/worker scratch storage disjoint from `out.ptr`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), out.ptr.add(dst_offset), sub_n);
+        }
+    }
+}
+
+fn with_worker_panel_scratch<R>(needed_elems: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    if needed_elems <= MAX_STACK_PANEL_ELEMS {
+        let mut stack_buf = [0.0_f32; MAX_STACK_PANEL_ELEMS];
+        return f(&mut stack_buf[..needed_elems]);
+    }
+    GEMM_PANEL_SCRATCH.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.len() < needed_elems {
+            guard.resize(needed_elems, 0.0_f32);
+        }
+        f(&mut guard[..needed_elems])
+    })
+}
+
 fn run_repacked_gemm_panels(
     repacked: &RepackedWeight,
     output: &mut [f32],
@@ -1618,26 +1725,17 @@ fn run_repacked_gemm_panels(
     if parallel && rows > PANEL_ROWS && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
         let n_panels = rows.div_ceil(PANEL_ROWS);
-        let panel_outputs = (0..n_panels)
-            .into_par_iter()
-            .map(|panel_idx| {
-                let row_start = panel_idx * PANEL_ROWS;
-                let row_end = (row_start + PANEL_ROWS).min(rows);
-                let sub_n = row_end - row_start;
-                let mut panel_buf = vec![0.0_f32; m * sub_n];
-                repacked
-                    .gemm_rows(&mut panel_buf, act, row_start..row_end)
-                    .map(|()| (row_start, sub_n, panel_buf))
+        let out_view = SharedMutOutput::new(output, rows);
+        return (0..n_panels).into_par_iter().try_for_each(|panel_idx| {
+            let row_start = panel_idx * PANEL_ROWS;
+            let row_end = (row_start + PANEL_ROWS).min(rows);
+            let sub_n = row_end - row_start;
+            with_worker_panel_scratch(m * sub_n, |panel_buf| {
+                repacked.gemm_rows(panel_buf, act, row_start..row_end)?;
+                scatter_panel_to_output(out_view, panel_buf, m, row_start, sub_n);
+                Ok(())
             })
-            .collect::<Result<Vec<_>, K3Error>>()?;
-
-        for (row_start, sub_n, panel_buf) in panel_outputs {
-            for tok in 0..m {
-                output[tok * rows + row_start..tok * rows + row_start + sub_n]
-                    .copy_from_slice(&panel_buf[tok * sub_n..(tok + 1) * sub_n]);
-            }
-        }
-        return Ok(());
+        });
     }
 
     let _ = parallel;
@@ -1665,7 +1763,6 @@ fn project_streaming_dense(
     };
 
     if m == 1 {
-        let mut scratch = vec![0.0_f32; cols];
         par_for_each_row_tile(output, PANEL_ROWS, parallel, |panel_idx, slice| {
             let row_start = panel_idx * PANEL_ROWS;
             let mut local_scratch = vec![0.0_f32; cols];
@@ -1675,7 +1772,6 @@ fn project_streaming_dense(
                 *slot = dot_f32(&local_scratch, input);
             }
         });
-        let _ = &mut scratch;
         return;
     }
 
@@ -2537,5 +2633,69 @@ mod tests {
             verify_model_repack_cache_for_arch("llama");
         }
         verify_model_repack_cache_for_arch("qwen2");
+    }
+
+    #[test]
+    fn test_scatter_panel_to_output_disjoint_columns_miri_safe() {
+        let m = 2_usize;
+        let rows = 68_usize;
+        let cols = 8_usize;
+        let mut raw = vec![0_u8; rows * cols * 4];
+        for r in 0..rows {
+            for c in 0..cols {
+                #[expect(clippy::cast_precision_loss, reason = "small test bounds fit in f32")]
+                let v = ((r * 7 + c * 3) % 29) as f32 * 0.05 - 0.5;
+                let off = (r * cols + c) * 4;
+                raw[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let dims = [cols, rows];
+        let view = TensorView::from_bytes("proj.weight", QuantType::F32, &dims, 0, &raw).unwrap();
+        let cached = CachedMatrix::repack(&view, rows, cols).unwrap();
+        let repacked = match &cached.storage {
+            CachedStorage::Repacked(w) => w,
+            CachedStorage::StreamingDense { .. } => panic!("expected Repacked storage"),
+        };
+        let input: Vec<f32> = (0..m * cols)
+            .map(|i| {
+                #[expect(clippy::cast_precision_loss, reason = "small test bounds fit in f32")]
+                let val = (i % 13) as f32 * 0.1 - 0.6;
+                val
+            })
+            .collect();
+        let mut act = QuantizedBatchAct::new();
+        act.quantize_into(&input, m, cols).unwrap();
+
+        let mut expected = vec![0.0_f32; m * rows];
+        repacked
+            .gemm_rows(&mut expected, &act.inner, 0..rows)
+            .unwrap();
+
+        let mut actual = vec![0.0_f32; m * rows];
+        let out_view = SharedMutOutput::new(&mut actual, rows);
+        let act_ref = &act.inner;
+        std::thread::scope(|scope| {
+            let h0 = scope.spawn(move || {
+                with_worker_panel_scratch(m * PANEL_ROWS, |buf| {
+                    repacked.gemm_rows(buf, act_ref, 0..PANEL_ROWS).unwrap();
+                    scatter_panel_to_output(out_view, buf, m, 0, PANEL_ROWS);
+                });
+            });
+            let h1 = scope.spawn(move || {
+                let sub_n = rows - PANEL_ROWS;
+                with_worker_panel_scratch(m * sub_n, |buf| {
+                    repacked.gemm_rows(buf, act_ref, PANEL_ROWS..rows).unwrap();
+                    scatter_panel_to_output(out_view, buf, m, PANEL_ROWS, sub_n);
+                });
+            });
+            h0.join().unwrap();
+            h1.join().unwrap();
+        });
+
+        assert_eq!(actual, expected);
+        // Exercise thread-local fallback path for oversized M without allocating per call on reuse.
+        with_worker_panel_scratch(MAX_STACK_PANEL_ELEMS + 4, |buf| {
+            assert_eq!(buf.len(), MAX_STACK_PANEL_ELEMS + 4);
+        });
     }
 }

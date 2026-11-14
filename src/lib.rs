@@ -860,4 +860,94 @@ mod tests {
         }
         assert!(logits.iter().all(|v| v.is_finite()));
     }
+
+    #[test]
+    fn test_wave3_chunked_start_position_and_compute_logits_miri_safe() {
+        let mut raw = build_compact_arch_gguf("llama", None, &[]);
+        let parsed = GgufFile::parse(&raw).unwrap();
+        let descs = parsed.metadata().tensors().to_vec();
+        for (idx, desc) in descs.iter().enumerate() {
+            let start = desc.absolute_offset();
+            let elems = desc.num_elements();
+            for e in 0..elems {
+                #[expect(clippy::cast_precision_loss, reason = "small bounded pattern")]
+                let val = (((e * 7 + idx * 5) % 19) as f32 - 9.0) * 0.04;
+                raw[start + e * 4..start + e * 4 + 4].copy_from_slice(&val.to_le_bytes());
+            }
+        }
+        let gguf = GgufFile::parse(&raw).unwrap();
+        let recipe = LlamaRecipe::from_gguf(&gguf).unwrap();
+        let cache = recipe.build_repack_cache(&gguf).unwrap();
+
+        let prompt: &[u32] = if cfg!(miri) { &[1, 2] } else { &[1, 2, 3, 4] };
+        let windows: &[Option<usize>] = if cfg!(miri) {
+            &[None]
+        } else {
+            &[None, Some(2)]
+        };
+        let split = prompt.len() / 2;
+        for &sw in windows {
+            let kv_geom = KvGeometry::new(1, 1, 8, 8, sw).unwrap();
+            let kv_len = kv_geom.required_f32_len().unwrap();
+
+            let mut logits_single = vec![0.0_f32; 12];
+            let mut kv_single = vec![0.0_f32; kv_len];
+            let mut ctx_single =
+                ExecutionContext::new_prefill(prompt, 8, &mut logits_single, &mut kv_single)
+                    .unwrap()
+                    .with_kv_geometry(kv_geom)
+                    .unwrap();
+            recipe
+                .prefill_step_with_cache(&mut ctx_single, &gguf, &cache)
+                .unwrap();
+
+            let mut kv_chunked = vec![0.0_f32; kv_len];
+            let mut empty_logits = Vec::new();
+            let mut ctx_c1 = ExecutionContext::new_prefill_chunk(
+                &prompt[..split],
+                8,
+                0,
+                false,
+                &mut empty_logits,
+                &mut kv_chunked,
+            )
+            .unwrap()
+            .with_kv_geometry(kv_geom)
+            .unwrap();
+            recipe
+                .prefill_step_with_cache(&mut ctx_c1, &gguf, &cache)
+                .unwrap();
+            assert_eq!(ctx_c1.position(), split);
+
+            let mut logits_chunked = vec![0.0_f32; 12];
+            let mut ctx_c2 = ExecutionContext::new_prefill_chunk(
+                &prompt[split..],
+                8,
+                split,
+                true,
+                &mut logits_chunked,
+                &mut kv_chunked,
+            )
+            .unwrap()
+            .with_kv_geometry(kv_geom)
+            .unwrap();
+            recipe
+                .prefill_step_with_cache(&mut ctx_c2, &gguf, &cache)
+                .unwrap();
+            assert_eq!(ctx_c2.position(), prompt.len());
+
+            for (i, (&a, &b)) in logits_single.iter().zip(&logits_chunked).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 1.0e-5,
+                    "chunked logit {i} mismatch (sw={sw:?}): {a} vs {b}"
+                );
+            }
+            for (i, (&a, &b)) in kv_single.iter().zip(&kv_chunked).enumerate() {
+                assert!(
+                    a.is_finite() && (a - b).abs() < 1.0e-5,
+                    "chunked KV {i} mismatch (sw={sw:?}): {a} vs {b}"
+                );
+            }
+        }
+    }
 }
