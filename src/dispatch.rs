@@ -229,8 +229,25 @@ pub fn project_lm_head_row_split(
         });
     };
 
-    let cached = get_or_repack(output_weight, rows, cols)?;
     let parallel = !layout.matmul.is_empty();
+    let quant = output_weight.quant();
+    if crate::repack_cache::is_oversized_dense(quant, rows, cols) {
+        let raw = output_weight.as_bytes();
+        crate::repack_cache::par_for_each_row_tile(
+            logits,
+            crate::repack_cache::PANEL_ROWS,
+            parallel,
+            |panel_idx, slice| {
+                let row_start = panel_idx * crate::repack_cache::PANEL_ROWS;
+                for (local_r, slot) in slice.iter_mut().enumerate() {
+                    *slot = compute_row_dot(row_start + local_r, cols, quant, raw, hidden);
+                }
+            },
+        );
+        return Ok(());
+    }
+
+    let cached = get_or_repack(output_weight, rows, cols)?;
     cached.gemv_rows(logits, hidden, parallel)
 }
 
